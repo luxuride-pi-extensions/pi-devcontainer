@@ -14,14 +14,15 @@
  * not have caught it.
  */
 
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { asJsonObject, parseJsonc } from "./jsonc.js";
 import { isProxyBreakError } from "./errors.js";
 import { alreadyInContainer, loadDevcontainerJson } from "./config.js";
-import { createContainerOps } from "./container-ops.js";
+import { createContainerOps, settleBringUp } from "./container-ops.js";
+import { provisionContainer } from "./provision.js";
 import { shq } from "./exec.js";
 import type { DevcontainerConfig } from "./types.js";
 
@@ -217,6 +218,121 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		rmSync(bin, { recursive: true, force: true });
 		rmSync(projectCwd, { recursive: true, force: true });
 		rmSync(outsideCwd, { recursive: true, force: true });
+	}
+}
+
+// --- settleBringUp ----------------------------------------------------
+// Both command paths share one implementation, so the failure classification
+// cannot drift: the bash tool falls back to the LOCAL shell on failure, while
+// `!`/`!!` user bash reaches exec directly and must throw instead.
+{
+	// SAFETY: settleBringUp only ever reads cfg.pendingUp. A real
+	// DevcontainerConfig sits in exactly this state whenever the session is
+	// outside a bring-up window, because pendingUp is optional and stays
+	// unset. The cast avoids spelling out the required fields this test never
+	// exercises, so a future field addition cannot break the test for no gain.
+	const cfg = { pendingUp: undefined } as unknown as DevcontainerConfig;
+
+	// No bring-up in flight: resolves immediately, in both states.
+	await settleBringUp(cfg, () => true);
+	await settleBringUp(cfg, () => false);
+	checkTrue("settleBringUp with no pendingUp resolves", true);
+
+	cfg.pendingUp = Promise.resolve();
+	await settleBringUp(cfg, () => true);
+	checkTrue("settleBringUp resolves when up succeeded and proxy enabled", true);
+
+	// Bring-up rejected: the promise is swallowed and the failure is reported
+	// by the throw, because `pendingUp` rejecting is the NORMAL signal.
+	cfg.pendingUp = Promise.reject(new Error("up exited 1"));
+	let msg = "";
+	try {
+		await settleBringUp(cfg, () => false);
+	} catch (err) {
+		msg = err instanceof Error ? err.message : String(err);
+	}
+	check("settleBringUp throws on rejected up", msg, "devcontainer bring-up failed; proxy disabled");
+	checkTrue("bring-up throw is classified non-breaking", !isProxyBreakError(new Error(msg)));
+}
+
+// --- provisioning marker keys on features too -------------------------
+// End-to-end through a fake CLI that shims to a real bash, so the marker
+// file actually lands in a temp $HOME and the "did it run again" question is
+// answered by counting appends to a log, not by reading the hash.
+{
+	const bin = mkdtempSync(join(tmpdir(), "dc-prov-bin-"));
+	const home = mkdtempSync(join(tmpdir(), "dc-prov-home-"));
+	const log = join(home, "ran.log");
+	// provisionContainer builds argv as
+	//   <prefix...> bash -lc <script> pi-override <marker>
+	// so the shim finds `-lc` and re-invokes bash with BOTH trailing
+	// positional args preserved: bash needs $0=pi-override and $1=marker,
+	// because the marker probe is literally `[ -e "$HOME/$1" ]`. Dropping
+	// the last arg silently made the probe look for a file named
+	// "pi-override", which the matching `touch` then created — so every
+	// later call looked "already provisioned" regardless of the marker key.
+	const fake = join(bin, "devcontainer");
+	writeFileSync(
+		fake,
+		'#!/bin/sh\nwhile [ "$1" != "-lc" ]; do shift; done\nshift\nexec /bin/bash -c "$1" "$2" "$3"\n',
+	);
+	chmodSync(fake, 0o755);
+
+	const prevPath = process.env.PATH;
+	const prevHome = process.env.HOME;
+	process.env.PATH = `${bin}:${prevPath ?? ""}`;
+	process.env.HOME = home;
+	// Every call appends one line to the log via the injected first command,
+	// so the log length is exactly the number of times provisioning RAN.
+	const logLines = (): number => {
+		try {
+			return readFileSync(log, "utf-8").trim().split("\n").filter(Boolean).length;
+		} catch {
+			return 0;
+		}
+	};
+	const countRuns = async (provision: string[], features?: Record<string, unknown>) => {
+		await provisionContainer(
+			() => {},
+			[join(bin, "devcontainer"), "exec", "--workspace-folder", "/x", "--"],
+			[`echo ran >> "$HOME/ran.log"`, ...provision],
+			features,
+		);
+		try {
+			return readFileSync(log, "utf-8").trim().split("\n").filter(Boolean).length;
+		} catch {
+			return 0;
+		}
+	};
+	try {
+		check("first provision runs the commands", await countRuns([]), 1);
+		check("second provision is skipped via the marker", await countRuns([]), 1);
+
+		// THE FIX: a changed feature set rebuilds the image and changes the
+		// environment the commands run in, so it must invalidate the marker.
+		// When the marker hashed only `provision`, this stayed at 1.
+		check("changed features re-run provisioning", await countRuns([], { node: "20" }), 2);
+		check("same features do not re-run", await countRuns([], { node: "20" }), 2);
+
+		// Key order must not matter, or reformatting pi-override.json alone
+		// would re-run every command.
+		check("feature key order is irrelevant", await countRuns([], { node: "20", python: "3" }), 3);
+		check("reordered features are still skipped", await countRuns([], { python: "3", node: "20" }), 3);
+		check("changed provision re-runs", await countRuns(["true"], { python: "3", node: "20" }), 4);
+
+		// A failing command must NOT write a marker, so the next session
+		// retries. Counted straight off the log, because calling countRuns()
+		// here would itself re-provision and blur the comparison.
+		const run = (provision: string[], features?: Record<string, unknown>) =>
+			provisionContainer(() => {}, [join(bin, "devcontainer")], provision, features).then(logLines);
+		check("failing command still ran its command", await run(['echo ran >> "$HOME/ran.log"; false']), 5);
+		check("failing command is retried (no marker written)", await run(['echo ran >> "$HOME/ran.log"; false']), 6);
+	} finally {
+		process.env.PATH = prevPath;
+		if (prevHome === undefined) delete process.env.HOME;
+		else process.env.HOME = prevHome;
+		rmSync(bin, { recursive: true, force: true });
+		rmSync(home, { recursive: true, force: true });
 	}
 }
 

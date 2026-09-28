@@ -8,6 +8,23 @@ import { shq } from "./exec.js";
 import type { DevcontainerConfig } from "./types.js";
 
 /**
+ * Settle a background `devcontainer up` / `docker start` and report whether
+ * it succeeded. Both command paths must wait for it, but they live in
+ * different layers and recover differently: the bash TOOL falls back to the
+ * local shell, while `!`/`!!` user bash goes straight to `createContainerOps`
+ * and must throw instead (user bash has no local shell to fall back to).
+ *
+ * The await itself is deliberately the same cached promise in both, so
+ * waiting twice costs a microtask, not a second `up`. Centralised here so the
+ * failure classification cannot drift between the two call sites.
+ */
+export async function settleBringUp(cfg: DevcontainerConfig, isEnabled: () => boolean): Promise<void> {
+	if (!cfg.pendingUp) return;
+	await cfg.pendingUp.catch(() => undefined);
+	if (!isEnabled()) throw new Error("devcontainer bring-up failed; proxy disabled");
+}
+
+/**
  * `warn` is called when a requested cwd lies outside the mounted workspace,
  * in which case the command is silently re-based onto the workspace root
  * (the host path does not exist inside the container). The call site
@@ -24,10 +41,10 @@ export function createContainerOps(
 			// background (e.g. a first-run image pull) — wait for it before
 			// running anything inside. A failed bring-up already disabled
 			// the proxy; throw so the caller falls back to the local shell.
-			if (cfg.pendingUp) {
-				await cfg.pendingUp.catch(() => undefined);
-				if (!isEnabled()) throw new Error("devcontainer bring-up failed; proxy disabled");
-			}
+			// This is the ONLY wait on this path: `!`/`!!` user bash reaches
+			// exec directly, without passing through the bash tool's own
+			// settleBringUp call, so it cannot rely on that one.
+			await settleBringUp(cfg, isEnabled);
 			// Cheap belt-and-braces re-check for detached sessions.
 			if (!cfg.useCli) await ensureDockerContainer(cfg);
 

@@ -38,7 +38,7 @@ import { basename, isAbsolute, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { type BashOperations, createBashTool } from "@earendil-works/pi-coding-agent";
 
-import { createContainerOps } from "./container-ops.js";
+import { createContainerOps, settleBringUp } from "./container-ops.js";
 import { alreadyInContainer, hasDevcontainerCli, loadDevcontainerJson } from "./config.js";
 import { ensureDockerContainer } from "./docker.js";
 import { isProxyBreakError } from "./errors.js";
@@ -108,13 +108,13 @@ export default function (pi: ExtensionAPI) {
 				// (session start never blocks on `devcontainer up`). Wait
 				// for it; if it failed, the proxy is already disabled — run
 				// the command locally, matching the old "up failed → proxy
-				// off" behavior.
-				if (cfg.pendingUp) {
-					const ok = await cfg.pendingUp.then(
-						() => true,
-						() => false,
-					);
-					if (!ok || !enabled) return localBash.execute(id, params, signal, onUpdate);
+				// off" behavior. settleBringUp is shared with the ops layer
+				// so the two call sites cannot disagree on what counts as
+				// bring-up failure.
+				try {
+					await settleBringUp(cfg, () => enabled);
+				} catch {
+					return localBash.execute(id, params, signal, onUpdate);
 				}
 				const containerBash = createBashTool(localCwd, { operations: containerOps });
 				try {
@@ -338,6 +338,10 @@ export default function (pi: ExtensionAPI) {
 						notify,
 						["devcontainer", "exec", "--workspace-folder", wsFolder, "--"],
 						override.provision,
+						// Same object handed to `--additional-features` above, so
+						// the provisioning marker key tracks the image rebuild
+						// the CLI is about to perform.
+						override.features,
 					);
 				}
 				notify(`Devcontainer ready: ${c.containerName}${c.remoteWorkspace ? ` — workspace at ${c.remoteWorkspace} (host: ${c.projectCwd})` : ""}`, "info");

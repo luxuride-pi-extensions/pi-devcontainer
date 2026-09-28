@@ -3,16 +3,44 @@ import { createHash } from "node:crypto";
 import { run } from "./exec.js";
 
 /**
+ * Stable stringify: object keys are emitted in sorted order at every depth so
+ * the provisioning marker key depends only on the CONTENT of `features`, not
+ * on the key order that happened to appear in the JSONC file. Without this,
+ * reformatting pi-override.json could silently re-run (or skip) provisioning.
+ */
+function stableStringify(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+	if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+	const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`;
+}
+
+/**
  * Run override provision commands once per container. Idempotency marker:
- * <home>/.pi-override-<sha256 of the command set, 16 hex>. If the marker
- * exists, nothing runs; if all commands exit 0, the marker is written.
+ * <home>/.pi-override-<sha256 of the feature set + command set, 16 hex>.
+ * If the marker exists, nothing runs; if all commands exit 0, the marker is
+ * written.
+ *
+ * `features` is part of the marker key, not an afterthought: features are baked
+ * into the image and alter the environment that provision commands run in.
+ * Hashing only `provision` meant adding a feature to pi-override.json rebuilt
+ * the image but left the marker untouched, so the new feature's setup was
+ * never applied. The marker only existed to avoid re-running commands, so
+ * keying it on everything that can change their outcome is strictly safer.
+ *
+ * Callers in docker-fallback mode pass no features: the CLI cannot apply them
+ * there, so no image change can occur and nothing can go stale.
  */
 export async function provisionContainer(
 	notify: (msg: string, level: "info" | "warning") => void,
 	execPrefix: string[],
 	provision: string[],
+	features?: Record<string, unknown>,
 ): Promise<void> {
-	const marker = `.pi-override-${createHash("sha256").update(provision.join("\n")).digest("hex").slice(0, 16)}`;
+	const marker = `.pi-override-${createHash("sha256")
+		.update(stableStringify({ features: features ?? null, provision }))
+		.digest("hex")
+		.slice(0, 16)}`;
 	// The marker is passed as a positional parameter rather than
 	// interpolated into the script. Interpolation also worked: `${marker}`
 	// is a JS template placeholder (marker is a known constant) while the
