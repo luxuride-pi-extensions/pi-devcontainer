@@ -1,0 +1,13 @@
+# Dependencies installed for typechecking; not part of the extension source.
+node_modules/
+
+# Throwaway build output from `npm test` (tsc --outDir .smoke-build).
+.smoke-build/
+
+# Build artifacts, in case anyone flips noEmit off.
+*.js.map
+dist/
+
+# Editor / OS noise
+.DS_Store
+*.swp

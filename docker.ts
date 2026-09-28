@@ -1,0 +1,46 @@
+import type { DevcontainerConfig } from "./types.js";
+import { run } from "./exec.js";
+
+export async function ensureDockerContainer(cfg: DevcontainerConfig): Promise<void> {
+	const name = cfg.containerName;
+	if (!cfg.image) {
+		throw new Error(
+			'devcontainer.json has no "image" field and the devcontainer CLI is not available; cannot run the container with plain docker',
+		);
+	}
+	const inspect = await run("docker", ["inspect", "-f", "{{.State.Status}}", name]);
+	if (inspect.code === 0) {
+		if (inspect.stdout.trim() === "running") return;
+		await run("docker", ["start", name]);
+		return;
+	}
+	// Container does not exist - create it, mounting the config root
+	// (the directory containing devcontainer.json, which may be a
+	// parent of the project — the mount then includes the project as
+	// a subdirectory) at its host path.
+	// Mount the declared workspace folder at the SAME host path, so host
+	// absolute paths keep working inside the container (unlike CLI mode,
+	// which virtualizes the mount point). NOTE: containers created by an
+	// older version of this extension keep their original mount until they
+	// are removed (docker run is skipped while the container exists).
+	const mount = `${cfg.workspaceFolder}:${cfg.workspaceFolder}`;
+	const r = await run("docker", [
+		"run",
+		"-d",
+		"--name",
+		name,
+		"-v",
+		mount,
+		"-w",
+		cfg.projectCwd,
+		// NB: no HOME override. Images whose user is not root (node:*-slim,
+		// python:*-slim, golang:*) would get HOME=/root while running as
+		// uid 1000, breaking every cache/config path with EACCES. The
+		// image's own ENV HOME is the only correct value.
+		cfg.image,
+		"tail",
+		"-f",
+		"/dev/null",
+	]);
+	if (r.code !== 0) throw new Error(`docker run failed: ${r.stderr.trim()}`);
+}
