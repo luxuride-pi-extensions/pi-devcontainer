@@ -60,8 +60,8 @@ export function parseJsonc(text: string): JsonValue {
 		// Remove trailing commas before } or ] with a second STRING-AWARE pass.
 		// `out` is still raw text and therefore still contains string
 		// literals, so a bare regex would corrupt values such as
-		// "sed -e 's/,}//' file.json" (verified: it lost the comma AND the
-		// brace, silently changing the command). Instead, remember the
+		// "sed -e 's/,}//' file.json" — it eats the comma AND the brace inside
+		// the string, silently changing the command. Instead, remember the
 		// position of the last comma and drop it only when the next
 		// non-whitespace character turns out to be } or ].
 		let res = "";
