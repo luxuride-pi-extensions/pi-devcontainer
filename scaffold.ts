@@ -1,13 +1,12 @@
 /**
  * Scaffold a devcontainer.json for a project that has none.
  *
- * The generated config is deliberately image-based rather than
- * build-based: an `image` field needs no Dockerfile, no build context, and
- * works with the plain-docker fallback, while still getting the right
- * toolchain from a maintained devcontainers feature. A Dockerfile is the
- * right answer for system packages the image lacks — that is a follow-up
- * edit the model can make with the normal file tools, not something to
- * guess at from a stack sniff.
+ * The generated config is image-based rather than build-based: an `image`
+ * field needs no Dockerfile, no build context, and works with the plain-docker
+ * fallback, while still getting the right toolchain from a maintained
+ * devcontainers image. A Dockerfile is the right answer for system packages
+ * the image lacks, which is an edit the model can make with the normal file
+ * tools.
  *
  * Detection reads only the project root's own marker files. It never walks
  * up: a monorepo's root marker set is what defines the container, and a
@@ -26,18 +25,15 @@ export const BASE_IMAGE = "mcr.microsoft.com/devcontainers/base:ubuntu";
  *
  * The devcontainers site publishes an index of feature and template
  * COLLECTIONS, but no machine-readable catalog of base images, so this list
- * is curated and can lag. That is the right trade: an image name that has
- * gone away is caught immediately by the first build, whereas a hidden list
- * would leave the model inventing `node:20-slim` style tags that do not exist
- * for these images.
+ * is curated. A curated list is safer than a hidden one: the model is offered
+ * real references instead of inventing `node:20-slim` style tags that do not
+ * exist for these images.
  *
- * Tags are chosen to be STABLE rather than newest. MCR publishes far more
- * versions than a generated config should assume — dotnet reaches 10.0,
- * java 25, typescript-node 26 — and defaulting every project to the newest
- * would silently build it against a runtime it was never tested with. Each
- * tag below is verified to resolve; the smoke tests re-check the ones that
- * are cheapest to check, so a removed tag fails there rather than on a user's
- * first build.
+ * Tags are STABLE, not newest. MCR publishes far more versions than a
+ * generated config should assume — dotnet reaches 10.0, java 25,
+ * typescript-node 26 — and defaulting every project to the newest would build
+ * it against a runtime it was never tested with. The smoke tests re-check
+ * every tag below against the registry, so a removed tag fails there.
  */
 export const BASE_IMAGES: { image: string; for: string }[] = [
 	{ image: "mcr.microsoft.com/devcontainers/base:ubuntu", for: "nothing in particular; add features for what you need" },

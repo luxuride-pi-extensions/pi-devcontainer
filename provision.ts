@@ -21,15 +21,13 @@ function stableStringify(value: unknown): string {
  * If the marker exists, nothing runs; if all commands exit 0, the marker is
  * written.
  *
- * `features` is part of the marker key, not an afterthought: features are baked
- * into the image and alter the environment that provision commands run in.
- * Hashing only `provision` meant adding a feature to pi-override.json rebuilt
- * the image but left the marker untouched, so the new feature's setup was
- * never applied. The marker only existed to avoid re-running commands, so
- * keying it on everything that can change their outcome is strictly safer.
+ * `features` belongs in the marker key because features are baked into the
+ * image and so alter the environment provision commands run in. Keying on
+ * `provision` alone would leave a stale marker behind whenever a feature is
+ * added or removed.
  *
  * Callers in docker-fallback mode pass no features: the CLI cannot apply them
- * there, so no image change can occur and nothing can go stale.
+ * there, so no image change can occur.
  */
 export async function provisionContainer(
 	notify: (msg: string, level: "info" | "warning") => void,
@@ -41,13 +39,11 @@ export async function provisionContainer(
 		.update(stableStringify({ features: features ?? null, provision }))
 		.digest("hex")
 		.slice(0, 16)}`;
-	// The marker is passed as a positional parameter rather than
-	// interpolated into the script. Interpolation also worked: `${marker}`
-	// is a JS template placeholder (marker is a known constant) while the
-	// unbraced `$HOME` is left for bash to expand, so `[ -e $HOME/<marker> ]`
-	// expanded correctly. Passing it as "$1" is still preferable — the
-	// script no longer embeds an unescaped path, and it stays correct if a
-	// marker ever contained shell metacharacters.
+	// The marker is passed as a positional parameter rather than interpolated
+	// into the script, so the script embeds no unescaped path. Note that
+	// `${marker}` is a JS template placeholder while the unbraced `$HOME` is
+	// left for bash to expand.
+	//
 	// The tuple type is load-bearing, and `run` takes (cmd, args) rather than
 	// a rest parameter, so a full argv is unpacked explicitly — `run(...argv)`
 	// cannot typecheck. `execPrefix[0]` is only string|undefined under
@@ -66,8 +62,7 @@ export async function provisionContainer(
 	}
 	if (markerExists) return;
 	notify(`Provisioning devcontainer (${provision.length} command(s), one-time)...`, "info");
-	let allOk = true;
-	for (const cmd of provision) {
+	let allOk = true;	for (const cmd of provision) {
 		try {
 			const r = await run(prefix, [...execPrefix.slice(1), "bash", "-lc", cmd]);
 			if (r.code !== 0) {

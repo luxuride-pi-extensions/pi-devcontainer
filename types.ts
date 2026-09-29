@@ -1,13 +1,3 @@
-import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-export { type BashOperations } from "@earendil-works/pi-coding-agent";
-
-/**
- * The slice of the UI context this extension touches. `notify` is included
- * because notifications are emitted from places that only hold this object
- * (the `setStatus` closure, `disableProxy`).
- */
-export type StatusUI = Pick<ExtensionUIContext, "setStatus" | "theme" | "notify">;
-
 export interface DevcontainerConfig {
 	projectCwd: string;
 	/** canonical (symlink-resolved) project path — what the kernel sees */
@@ -26,8 +16,8 @@ export interface DevcontainerConfig {
 	useCli: boolean;
 	/**
 	 * Where the workspace is mounted inside the CLI-managed container (e.g.
-	 * /workspaces/<name>). The devcontainer CLI (>= 0.8) no longer mounts at
-	 * the host path, so host-path `cd`s inside the container would fail.
+	 * /workspaces/<name>). The CLI mounts at a container path rather than the
+	 * host path, so a host-path `cd` inside the container would fail.
 	 */
 	remoteWorkspace?: string;
 	/**

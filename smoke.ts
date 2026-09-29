@@ -9,9 +9,8 @@
  *
  * The container-exec tests are the important ones: they run the real
  * runInContainer against a fake `devcontainer` on PATH, so the generated
- * `bash -c '<command>'` string is asserted verbatim. That is where the
- * literal `cd '$HOME'` bug lived, and a unit test of the helper alone would
- * not have caught it.
+ * `bash -c '<command>'` string is asserted verbatim. A unit test of the cwd
+ * helper alone would not catch a wrong string reaching the shell.
  */
 
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -59,8 +58,8 @@ check("line comments stripped", parseJsonc('{\n// hi\n"a":1}'), { a: 1 });
 check("block comments stripped", parseJsonc('{/* x */"a":1}'), { a: 1 });
 check("trailing comma in object", parseJsonc('{"a":1,}'), { a: 1 });
 check("trailing comma in array", parseJsonc('{"a":[1,2,]}'), { a: [1, 2] });
-// The regression this guards: a naive regex for trailing commas used to eat
-// the comma AND the brace inside a string value, silently rewriting a command.
+// A naive regex for trailing commas also eats the comma AND the brace inside
+// a string value, silently rewriting whatever command that value holds.
 check("string containing ,} survives", parseJsonc(`{"cmd":"sed -e 's/,}//' f.json"}`), {
 	cmd: "sed -e 's/,}//' f.json",
 });
@@ -115,13 +114,13 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 
 // --- cwd translation (end-to-end through a fake devcontainer CLI) -------
 // The fake CLI prints its LAST argument, which is the `bash -c '<script>'`
-// string runInContainer built. Asserting that string verbatim is what
-// catches quoting regressions such as the literal `cd '$HOME'`, and asserting
-// the pair of returned paths is what keeps the two namespaces from blurring.
+// string runInContainer built. Asserting that string verbatim is what catches
+// quoting regressions, and asserting the pair of returned paths is what keeps
+// the two namespaces from blurring.
 {
 	const bin = mkdtempSync(join(tmpdir(), "dc-bin-"));
 	const realPath = process.env.PATH ?? "";
-	// NOTE: projectCwd must be a REAL directory. runInContainer spawns with
+	// projectCwd must be a REAL directory: runInContainer spawns with
 	// `cwd: cfg.projectCwd`, and node reports a nonexistent cwd as the same
 	// confusing `spawn devcontainer ENOENT` as a missing binary.
 	const projectCwd = mkdtempSync(join(tmpdir(), "dc-proj-"));
@@ -157,7 +156,7 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 			// runInContainer spawns `detached: true` + unref'd, so a lost
 			// 'close' event would leave this promise pending forever and node
 			// would exit with an "unsettled top-level await" instead of a useful
-			// failure. Bound every call so a regression reports which one it was.
+			// failure. Bound every call so a hang reports which call it was.
 			const label = `${JSON.stringify(params)} ${JSON.stringify(overrides)}`;
 			const res = await Promise.race([
 				runInContainer({ ...base, ...overrides } as DevcontainerConfig, { command: "echo hi", ...params }),
@@ -190,9 +189,9 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		check("absolute cwd taken at face value", abs.containerCwd, "/etc");
 		check("out-of-mount absolute cwd has no host counterpart claim", abs.hostCwd, "/etc");
 
-		// THE REGRESSION GUARD: an empty cwd must never become `cd '$HOME'` or
-		// any other invented directory — it is either the resolved mount or a
-		// hard error.
+		// An empty or unresolvable cwd must never become `cd '$HOME'` or any
+		// other invented directory — it is either the resolved mount or a hard
+		// error.
 		let noMountErr = "";
 		try {
 			await run({ cwd: "sub" }, { remoteWorkspace: undefined });
@@ -251,11 +250,11 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 // The tool awaits bring-up before its first call, and a failure must be
 // reported as a tool error rather than a container-less exec.
 {
-	// SAFETY: settleBringUp only ever reads cfg.pendingUp. A real
-	// DevcontainerConfig sits in exactly this state whenever the session is
-	// outside a bring-up window, because pendingUp is optional and stays
-	// unset. The cast avoids spelling out the required fields this test never
-	// exercises, so a future field addition cannot break the test for no gain.
+	// A real DevcontainerConfig sits in exactly this state whenever the
+	// session is outside a bring-up window, because pendingUp is optional
+	// and stays unset. The cast avoids spelling out the required fields this
+	// test never exercises, so a future field addition cannot break the test
+	// for no gain.
 	const cfg = { pendingUp: undefined } as unknown as DevcontainerConfig;
 
 	// No bring-up in flight: resolves immediately, in both states.
@@ -332,9 +331,8 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		check("first provision runs the commands", await countRuns([]), 1);
 		check("second provision is skipped via the marker", await countRuns([]), 1);
 
-		// THE FIX: a changed feature set rebuilds the image and changes the
-		// environment the commands run in, so it must invalidate the marker.
-		// When the marker hashed only `provision`, this stayed at 1.
+		// A changed feature set rebuilds the image and changes the environment
+		// the commands run in, so it must invalidate the marker.
 		check("changed features re-run provisioning", await countRuns([], { node: "20" }), 2);
 		check("same features do not re-run", await countRuns([], { node: "20" }), 2);
 
@@ -459,8 +457,8 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	});
 	checkTrue("a non-registry path is rejected", parseRef("some/path/feature:1") === undefined);
 
-	// Rows whose reference does not parse are dropped rather than handed to
-	// the model as if they were usable.
+	// A reference that does not parse must never reach the model as if it
+	// were usable.
 	const page = [
 		"<table><tr><th>x</th></tr>",
 		'<tr><td><a href="/f/1">Node.js</a></td><td>Dev Container Spec Maintainers</td><td><code>ghcr.io/devcontainers/features/node:1</code></td><td><code>2.1.0</code></td></tr>',
@@ -483,9 +481,9 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 
 // --- generated references must be REAL (live) ---------------------------
 // The curated BASE_IMAGES and STACK_FEATURES lists are the one part of this
-// extension that cannot be derived from a live source, and every entry that
-// was wrong produced a config that failed on the user's first build. These
-// checks make that a test failure here instead.
+// extension that cannot be derived from a live source, and a wrong entry
+// produces a config that fails on the user's first build. These checks make
+// that a test failure here instead.
 //
 // The catalog is the authority for features; MCR is the authority for images.
 // Both are network calls, and a failure to reach either is reported rather
@@ -512,9 +510,8 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	const perStack = stackIds().map((id) => baseImageFor(id));
 	checkTrue("no two stacks share a base image", new Set(perStack).size >= 7, perStack.join(" "));
 
-	// ...and every tag in the list still resolves. This is the whole check:
-	// a renamed or deleted tag must fail here rather than on a user's first
-	// build. MCR needs no auth, so this stays two lines.
+	// Every tag in the list must still resolve; a renamed or deleted tag has
+	// to fail here. MCR needs no auth, so this stays two lines.
 	const MANIFEST_ACCEPT =
 		"application/vnd.docker.distribution.manifest.v2+json, " +
 		"application/vnd.oci.image.index.v1+json, " +
@@ -571,8 +568,8 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	const versions = await publishedVersions("ghcr.io/devcontainers/features/node:1");
 	check("published majors, newest first", versions.versions.map((v) => v.tag), ["2", "1"]);
 	checkTrue("a version reports the feature's own version", versions.versions[0]!.version.startsWith("2"));
-	// dotnet:1 IS usable, and a project on .NET 8 needs it: the catalog would
-	// never surface it, which is the whole reason this lookup exists.
+	// dotnet:1 is a usable reference that the catalog never surfaces, since
+	// the catalog only shows the current major.
 	check("a superseded major is still reported", (await publishedVersions("ghcr.io/devcontainers/features/dotnet:2")).versions.map((v) => v.tag), ["2", "1"]);
 	// A reference with no tag at all names the same feature.
 	check("an untagged reference resolves the same feature", (await publishedVersions("ghcr.io/devcontainers/features/node")).versions.map((v) => v.tag), ["2", "1"]);

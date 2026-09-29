@@ -6,8 +6,8 @@ import { asJsonObject, parseJsonc, type JsonValue } from "./jsonc.js";
 
 /**
  * Global devcontainer override: ~/.devcontainer/pi-override.json (JSONC).
- * The devcontainer CLI has no user-level override mechanism, so the pi
- * extension applies this file itself to every project's devcontainer:
+ * The devcontainer CLI has no user-level override mechanism, so this
+ * extension applies the file itself to every project's devcontainer:
  *
  *   {
  *     "features": { ... },   // merged in via `devcontainer up
@@ -18,7 +18,7 @@ import { asJsonObject, parseJsonc, type JsonValue } from "./jsonc.js";
  *                            //   by the sha256 of the command set)
  *   }
  *
- * Provisioning is best-effort: failures warn but never disable the proxy.
+ * Provisioning is best-effort: a failure warns and the tools stay available.
  */
 export const GLOBAL_OVERRIDE_PATH = join(homedir(), ".devcontainer", "pi-override.json");
 

@@ -18,11 +18,13 @@ export async function ensureDockerContainer(cfg: DevcontainerConfig): Promise<vo
 	// (the directory containing devcontainer.json, which may be a
 	// parent of the project — the mount then includes the project as
 	// a subdirectory) at its host path.
+	//
 	// Mount the declared workspace folder at the SAME host path, so host
 	// absolute paths keep working inside the container (unlike CLI mode,
-	// which virtualizes the mount point). NOTE: containers created by an
-	// older version of this extension keep their original mount until they
-	// are removed (docker run is skipped while the container exists).
+	// which virtualizes the mount point). A container created by an earlier
+	// run keeps its original mount until it is removed: `docker run` is
+	// skipped while the container exists, so changing this mount requires
+	// `docker rm` first.
 	const mount = `${cfg.workspaceFolder}:${cfg.workspaceFolder}`;
 	const r = await run("docker", [
 		"run",

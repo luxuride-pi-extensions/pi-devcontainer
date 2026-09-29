@@ -7,12 +7,9 @@
  * exact OCI reference INCLUDING the major tag (e.g.
  * `ghcr.io/devcontainers/features/node:1`), and the feature's own version
  * (`2.1.0`). The site builds it by reading every collection repo's `src/`, so
- * it already contains every community collection — no per-repo API calls, and
- * no guessing about which collections exist.
- *
- * The older `_data/collection-index.yml` is deliberately NOT used: it lists
- * 317 collections and never names a feature inside them, so it cannot answer
- * "is there a postgres feature anywhere" without a fan-out over every repo.
+ * The site builds it by reading every collection repo's `src/`, so it already
+ * contains every community collection — no per-repo API calls, and no guessing
+ * about which collections exist.
  *
  * The page is ~570KB of HTML, fetched once a day and cached; the parsed form
  * is kept separately so a session can read it without re-parsing. A stale cache
@@ -106,9 +103,8 @@ function decode(s: string): string {
  *
  * Each row is: feature name (a link), maintainer, `<code>` OCI reference,
  * `<code>` version. Only rows with two code cells AND a reference that parses
- * are kept — the page has a couple of malformed entries, and a bogus
- * reference in the catalog would be handed straight to the model as if it
- * were verified.
+ * are kept, so a malformed entry never reaches the model as though it were
+ * verified.
  */
 export function parseFeaturesPage(html: string): CatalogFeature[] {
 	const out: CatalogFeature[] = [];
@@ -126,8 +122,8 @@ export function parseFeaturesPage(html: string): CatalogFeature[] {
 		if (seen.has(ref)) continue;
 		seen.add(ref);
 		// The maintainer sits in its own cell, so it is the first cell that
-		// carries neither the name link nor a code block. Guessing by index
-		// would silently pick the wrong cell if the site's column order ever
+		// carries neither the name link nor a code block. Picking by index
+		// would silently pick the wrong cell if the site's column order
 		// changed.
 		const maintainerCell = cells.find((c) => !c.includes("<a") && !c.includes("<code")) ?? "";
 		out.push({ name: decode(name), maintainer: stripTags(maintainerCell), ref, version: codes[1]! });
@@ -251,15 +247,14 @@ export interface PublishedVersion {
  *
  * The catalog only ever shows the CURRENT major, which is not enough to
  * choose: a project on .NET 8 needs `dotnet:1` while a new one wants
- * `dotnet:2`, and both are pullable. So the registry — not the catalog — is
- * the authority on which majors exist.
+ * `dotnet:2`, and both are pullable. The registry is therefore the authority
+ * on which majors exist, not the catalog.
  *
  * A tag list is not the whole truth either, so each major's manifest is
  * fetched and its `dev.containers.metadata` read. A major that does not
  * resolve, or resolves to something without feature metadata, is left out
- * rather than reported and then failing someone's build — the same rule the
- * catalog parser uses: a reference is only reported once it has been shown
- * to resolve.
+ * rather than reported and then failing someone's build — a reference is only
+ * reported once it has been shown to resolve.
  */
 export async function publishedVersions(reference: string): Promise<{ ref: string; versions: PublishedVersion[] }> {
 	// Both `ghcr.io/devcontainers/features/node` and `.../node:1` name the
@@ -286,10 +281,8 @@ export async function publishedVersions(reference: string): Promise<{ ref: strin
 	).json()) as { tags?: string[] | null };
 	const majors = [...new Set((listed.tags ?? []).filter((t) => /^\d+$/.test(t)))].sort((a, b) => Number(b) - Number(a));
 
-	// Resolve each major concurrently; a major that does not resolve is not a
-	// usable reference, so it is left out instead of being reported and then
-	// failing someone's build. Note that `docker manifest inspect` cannot be
-	// used for this check: it rejects a single-platform feature manifest with
+	// Resolve each major concurrently. `docker manifest inspect` cannot stand
+	// in for this check: it rejects a single-platform feature manifest with
 	// "unsupported manifest format" even though the devcontainer CLI builds it
 	// without complaint.
 	const settled = await Promise.allSettled(majors.map((tag) => resolveFeatureVersion(parsed.host, repo, tag, token)));

@@ -28,8 +28,8 @@
  *   (never blocking the prompt — a first-run image pull can take a long
  *   time); the first tool call waits for it to finish. `exec` alone does not
  *   create/attach the container (it fails with "Dev container not found"
- *   until `up` has run). If `up` fails the tool stays inactive and commands
- *   simply run on the host via `bash`, with a one-time warning.
+ *   until `up` has run). If `up` fails, calls to this tool report the error
+ *   rather than running anything on the host.
  * - Otherwise it falls back to plain docker, using the `image` field from
  *   devcontainer.json: it creates/starts a container
  *   `pi-devcontainer-<project>` that mounts the project at its current path
@@ -40,8 +40,8 @@
  *
  * A second tool, `create_devcontainer`, creates or edits the config. It does
  * not decide anything: the first call of a session reports the project's
- * stack, the available base images and the feature collections (fetched from
- * the published collection index, once per session) and writes nothing. The
+ * stack, the available base images and the feature catalog (fetched from
+ * https://containers.dev/features, once per session) and writes nothing. The
  * model then calls it again with the image and features it picked, and can
  * call it repeatedly to refine them. Edits are applied in place on top of the
  * existing config.
@@ -99,7 +99,7 @@ export default function (pi: ExtensionAPI) {
 	let sessionCwd: string | null = null;
 	// Fetched once per session on the config tool's first call.
 	let catalogPromise: Promise<CatalogFeature[]> | null = null;
-	// Held out of the promise so a failure can be reported per call without
+	// Held outside the promise so a failure can be reported per call without
 	// re-awaiting an already-rejected promise on every later call.
 	let catalogFailure: string | null = null;
 
@@ -119,7 +119,7 @@ export default function (pi: ExtensionAPI) {
 			const names = pi.getActiveTools();
 			pi.setActiveTools(next ? [...names, TOOL_NAME] : names.filter((n) => n !== TOOL_NAME));
 		} catch {
-			// see above: `active` is the real gate
+			// `active` is the real gate
 		}
 	};
 
@@ -167,8 +167,8 @@ export default function (pi: ExtensionAPI) {
 
 			const timeout = params.timeout === undefined || params.timeout <= 0 ? DEFAULT_TIMEOUT : params.timeout;
 			// Stream the output into the tool row as it arrives, on the same
-			// throttle and tail bound pi's own shell tool uses. Without this the
-			// row stays blank for the whole command and a slow build is
+			// throttle and tail bound pi's own shell tool uses. The row would
+			// otherwise stay blank for the whole command, leaving a slow build
 			// indistinguishable from a hung one.
 			const tail = new OutputTail();
 			let pending: ReturnType<typeof setTimeout> | undefined;
@@ -340,8 +340,8 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// A single "what is happening now" notice: the CLI/docker bring-up
-		// later reports readiness. Three toasts per session was noise.
+		// A single "what is happening now" notice; the CLI/docker bring-up
+		// later reports readiness.
 		notify(
 			useCli
 				? "Starting devcontainer in the background (first run may take a while); the devcontainer tool activates when it is ready..."
@@ -355,12 +355,11 @@ export default function (pi: ExtensionAPI) {
 		if (cfg.useCli) {
 			// `devcontainer exec` does not create the container on its own —
 			// it fails with "Dev container not found" until `up` has run.
-			// Run `up` in the BACKGROUND: a first-run image pull can take
-			// many minutes and must not block the prompt (session start).
-			// The first tool call awaits cfg.pendingUp before it runs.
-			// NOTE: no --quiet flag — it was removed from the devcontainer
-			// CLI (0.89.0 rejects it with "Unknown argument: quiet"). Output
-			// is piped away anyway.
+			// A first-run image pull can take many minutes, so `up` runs in
+			// the BACKGROUND: the prompt must not wait for it. The first tool
+			// call awaits cfg.pendingUp before it runs.
+			// The CLI has no --quiet flag (0.89.0 rejects it with
+			// "Unknown argument: quiet"). Output is piped away anyway.
 			// The CLI bind-mounts the folder it was given and resolves the
 			// config at <folder>/.devcontainer/ — it does NOT search upward —
 			// so pass the canonical (symlink-resolved) host path of the
@@ -377,9 +376,9 @@ export default function (pi: ExtensionAPI) {
 			cfg.workspaceFolder = wsFolder;
 			// Bring the container up in the background and resolve where the
 			// workspace is mounted (e.g. /workspaces/<name>); the first
-			// command awaits this promise. On failure the tool is never
-			// activated and pendingUp is rejected, so a call made in the
-			// window reports a clear error instead of a container-less exec.
+			// command awaits this promise. On failure `pendingUp` is rejected
+			// and a call made in the window reports the error instead of a
+			// container-less exec.
 			const c = cfg;
 			c.pendingUp = (async () => {
 				const up = await run("devcontainer", upArgs);
@@ -475,22 +474,14 @@ export default function (pi: ExtensionAPI) {
 			})();
 		}
 
-		// Offered as soon as bring-up is STARTED, not when it finishes: the
-		// first tool call awaits cfg.pendingUp (see settleBringUp), so a
-		// pending image pull blocks the call rather than making the tool look
-		// unavailable. Withholding it until ready would make a freshly
-		// scaffolded project report "use bash on the host instead" for the
-		// whole pull, which is the exact confusion this extension exists to
-		// avoid.
+		// Offered as soon as bring-up is STARTED: the first tool call awaits
+		// cfg.pendingUp (see settleBringUp), so a pending image pull blocks
+		// the call rather than making the tool look unavailable.
 		setToolActive(true);
 
-		// Bring-up failures are reported here rather than left as an unhandled
-		// rejection: the background promise is awaited by the first tool call,
-		// but a session that never calls the tool would otherwise surface a
-		// raw rejection instead of the actionable message.
-		// SAFETY: both branches above assign `c.pendingUp`, and `c` is the
-		// same object `cfg` points at. The assertion documents that the
-		// catch below is watching the promise both of them created.
+		// Both branches above assign `c.pendingUp`, and `c` is the same object
+		// `cfg` points at. A session that never calls the tool would otherwise
+		// surface the rejection unhandled.
 		(cfg.pendingUp as Promise<void>).catch((err: unknown) => {
 			notify(
 				`devcontainer unavailable — commands run through the devcontainer tool will fail until this is fixed: ${err instanceof Error ? err.message : String(err)}`,
@@ -506,10 +497,9 @@ export default function (pi: ExtensionAPI) {
 	 * the feature collections actually available, and writes nothing. The
 	 * model then calls it again with the image and features it chose; each
 	 * such call rewrites the config and restarts bring-up, so a config can be
-	 * built up across several calls instead of being committed to in one
-	 * guess. That split is deliberate: an image or a feature id that does not
-	 * exist is only discovered by a failed build, and a model that chose from
-	 * a live catalog is far less likely to invent one.
+	 * built up across several calls. The split is deliberate: an image or a
+	 * feature id that does not exist is only discovered by a failed build, and a
+	 * model that chose from a live catalog is far less likely to invent one.
 	 *
 	 * Edits read the existing config first and apply only the keys passed, so
 	 * a second call with just a new feature keeps the image, name and ports
@@ -731,8 +721,7 @@ export default function (pi: ExtensionAPI) {
 		// Registered but not offered: pi records the tool set in the
 		// transcript's first system message, so leaving it active in a project
 		// with no devcontainer would advertise a command the model cannot use.
-		// Done at the very start of session_start, before any await, so it
-		// lands before the prompt is built.
+		// Done before any await so it lands before the prompt is built.
 		setToolActive(false);
 
 		if (alreadyInContainer()) return;

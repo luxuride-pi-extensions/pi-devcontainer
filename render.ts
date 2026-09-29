@@ -3,18 +3,16 @@
  * tool uses, so a command in the container reads exactly like a command on
  * the host.
  *
- * That means the command on its own line, a blank line, up to five lines of
+ * Layout: the command on its own line, a blank line, up to five lines of
  * output with a "... (n earlier lines, ctrl+o to expand)" hint above them,
- * and a duration footer. The streaming behaviour matters as much as the
- * layout: output is pushed to the TUI as it arrives (throttled, and capped at
- * a bounded tail) rather than appearing all at once when the process exits,
- * so a long build is visibly progressing instead of looking hung.
+ * and a duration footer. Output is pushed to the TUI as it arrives (throttled,
+ * and capped at a bounded tail) so a long build is visibly progressing rather
+ * than looking hung.
  *
  * The key hint and the visual-line truncation come from pi's public entry
- * point rather than being re-implemented, so the expand hint matches the
- * built-in shell tool exactly and stays in step with it. Colours come from
- * the `Theme` instance pi passes to every renderer, since the module-level
- * `theme` singleton is not exported.
+ * point, so the expand hint matches the built-in shell tool exactly. Colours
+ * come from the `Theme` instance pi passes to every renderer, since the
+ * module-level `theme` singleton is not exported.
  */
 import { Container, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import { keyHint, truncateToVisualLines, type AgentToolResult, type Theme, type ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
@@ -22,7 +20,7 @@ import { keyHint, truncateToVisualLines, type AgentToolResult, type Theme, type 
 /** Mirrors pi's own shell preview: lines of output shown when collapsed. */
 const PREVIEW_LINES = 5;
 
-/** Matches pi's shell tool update throttle; faster just burns redraws. */
+/** Matches pi's shell tool update throttle; a faster one only burns redraws. */
 export const UPDATE_THROTTLE_MS = 100;
 
 /**
@@ -94,10 +92,10 @@ function commandText(args: Record<string, unknown> | undefined, theme: Theme): s
 	const timeout = typeof args?.timeout === "number" ? args.timeout : undefined;
 	const suffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
 	const display = command ? command : theme.fg("toolOutput", "...");
-	// The `devcontainer` prefix is the one thing that must never be missed:
-	// this row is deliberately shaped like a shell command, and in a
-	// transcript where some rows run on the host and some in the container an
-	// unlabelled one would read as the same tool changing environments.
+	// The `devcontainer` prefix is what separates this row from a host
+	// command: the rest of the row is deliberately shaped like a shell
+	// command, so an unlabelled one would read as the same tool changing
+	// environments.
 	return theme.fg("accent", "devcontainer") + theme.fg("toolTitle", theme.bold(` $ ${display}`)) + suffix;
 }
 
