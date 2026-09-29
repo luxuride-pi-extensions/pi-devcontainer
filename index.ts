@@ -138,6 +138,7 @@ export default function (pi: ExtensionAPI) {
 			"- `cwd` (optional): directory to run in, relative to the workspace root inside the container, or an absolute CONTAINER path. Omit it for the workspace root. A host path does not exist here; the result reports the host path of the directory actually used so `read`/`edit`/`write` can target the same files.",
 			"- `stdin` (optional): text piped to the command's standard input. Use it for heredocs and piped input instead of shell redirection to a file.",
 			"- `timeout` (optional): seconds before the command is killed (default 120).",
+			"- `tail` (optional): keep only the LAST N lines of output, for commands whose interesting part is at the end (`npm test`, `cargo build`, a failing build). Omit it to keep the default limit. Use it when the output is mostly noise — you can always re-run with a bigger `tail` or read a log file the command wrote.",
 		].join("\n"),
 		promptSnippet: "Run a shell command inside this project's devcontainer",
 		promptGuidelines: [
@@ -153,6 +154,12 @@ export default function (pi: ExtensionAPI) {
 			),
 			stdin: Type.Optional(Type.String({ description: "Text piped to the command's stdin" })),
 			timeout: Type.Optional(Type.Number({ description: "Seconds before the command is killed (default 120)" })),
+			tail: Type.Optional(
+				Type.Number({
+					description:
+						"Keep only the last N lines of output. Use for commands whose interesting output is at the end; omit for the default limit.",
+				}),
+			),
 		}),
 		renderShell: "default",
 		...createDevcontainerRenderers(),
@@ -224,7 +231,11 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`devcontainer command timed out after ${timeout} seconds (cwd ${result.containerCwd})`);
 			}
 
-			const truncated = truncateTail(result.output);
+			if (params.tail !== undefined && (!Number.isFinite(params.tail) || params.tail < 1)) {
+				throw new Error(`tail must be a line count of at least 1, got ${params.tail}`);
+			}
+
+			const truncated = truncateTail(result.output, params.tail === undefined ? undefined : { maxLines: params.tail });
 			const header = [
 				`container cwd: ${result.containerCwd}`,
 				`host cwd: ${result.hostCwd}`,
@@ -247,9 +258,13 @@ export default function (pi: ExtensionAPI) {
 				// ride along on the error: the agent loop replaces a thrown tool
 				// error with `{content, details:{}}`, so the output has to be
 				// part of the message. The streamed updates have already shown
-				// it in the TUI by this point.
+				// it in the TUI by this point. The same `tail` cap applies here,
+				// or a failing chatty command would defeat the point of passing it.
+				const shown = truncated.truncated
+					? `${truncated.content}\n[output truncated: ${truncated.totalLines} lines / ${truncated.totalBytes} bytes total, showing last ${truncated.outputLines} lines]`
+					: truncated.content;
 				throw new Error(
-					`devcontainer command exited with code ${result.exitCode} (cwd ${result.containerCwd})\n${truncated.content}`,
+					`devcontainer command exited with code ${result.exitCode} (cwd ${result.containerCwd})\n${shown}`,
 				);
 			}
 			return {

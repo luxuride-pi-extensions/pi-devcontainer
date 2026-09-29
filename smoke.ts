@@ -25,6 +25,7 @@ import { shq } from "./exec.js";
 import { BASE_IMAGE, BASE_IMAGES, DOTNET_FEATURE, NODE_FEATURE, STACK_FEATURES, baseImageFor, featureFor, projectProfile, scaffold, stackIds } from "./scaffold.js";
 import { collectionsIn, featuresInCollection, loadCatalog, parseFeaturesPage, parseRef, publishedVersions, searchFeatures } from "./features-index.js";
 import { MAX_DISPLAY_BYTES_FOR_TEST, OutputTail } from "./render.js";
+import { truncateTail } from "@earendil-works/pi-coding-agent";
 import type { DevcontainerConfig } from "./types.js";
 
 let failures = 0;
@@ -244,6 +245,24 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		rmSync(bin, { recursive: true, force: true });
 		rmSync(projectCwd, { recursive: true, force: true });
 	}
+}
+
+// --- output truncation -------------------------------------------------
+// The cap applies to what the MODEL receives, and the truncation note has to
+// survive alongside the kept lines, or a short result looks like a short
+// command.
+{
+	const lines = Array.from({ length: 40 }, (_, i) => `line ${i + 1}`).join("\n");
+	const all = truncateTail(lines);
+	check("no cap keeps every line", all.truncated, false);
+
+	const capped = truncateTail(lines, { maxLines: 5 });
+	check("the cap keeps the last N lines", capped.content.split("\n").map((l) => l.trim()), ["line 36", "line 37", "line 38", "line 39", "line 40"]);
+	check("the cap reports the original size", capped.totalLines, 40);
+	check("the cap reports what it kept", capped.outputLines, 5);
+	check("a cap looser than the output is not truncation", truncateTail(lines, { maxLines: 5000 }).truncated, false);
+	check("a single line is kept whole", truncateTail("only", { maxLines: 1 }).content, "only");
+	check("the kept lines are not indented or padded", capped.content.split("\n")[0], "line 36");
 }
 
 // --- settleBringUp ----------------------------------------------------

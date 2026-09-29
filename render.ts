@@ -90,12 +90,18 @@ function formatDuration(ms: number): string {
 function commandText(args: Record<string, unknown> | undefined, theme: Theme): string {
 	const command = typeof args?.command === "string" ? args.command : undefined;
 	const timeout = typeof args?.timeout === "number" ? args.timeout : undefined;
-	const suffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
-	const display = command ? command : theme.fg("toolOutput", "...");
+	const tail = typeof args?.tail === "number" ? args.tail : undefined;
 	// The `devcontainer` prefix is what separates this row from a host
 	// command: the rest of the row is deliberately shaped like a shell
 	// command, so an unlabelled one would read as the same tool changing
 	// environments.
+	//
+	// The tail cap is shown because the row and the model's copy of the
+	// output differ once it is set; a row ending at 5 lines with no
+	// explanation reads as the command having produced that much.
+	const suffix =
+		(timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "") + (tail !== undefined ? theme.fg("muted", ` (tail ${tail})`) : "");
+	const display = command ? command : theme.fg("toolOutput", "...");
 	return theme.fg("accent", "devcontainer") + theme.fg("toolTitle", theme.bold(` $ ${display}`)) + suffix;
 }
 
