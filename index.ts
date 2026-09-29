@@ -69,6 +69,7 @@ import { run } from "./exec.js";
 import { loadGlobalOverride } from "./override.js";
 import { provisionContainer } from "./provision.js";
 import { ensureReady, runInContainer } from "./run-in-container.js";
+import { createDevcontainerRenderers, OutputTail, UPDATE_THROTTLE_MS, type DevcontainerDetails } from "./render.js";
 import { collectionsIn, featuresInCollection, loadCatalog, publishedVersions, searchFeatures, type CatalogFeature } from "./features-index.js";
 import { asJsonObject, parseJsonc } from "./jsonc.js";
 import { BASE_IMAGES, detectStack, projectProfile, scaffold } from "./scaffold.js";
@@ -154,7 +155,8 @@ export default function (pi: ExtensionAPI) {
 			timeout: Type.Optional(Type.Number({ description: "Seconds before the command is killed (default 120)" })),
 		}),
 		renderShell: "default",
-		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+		...createDevcontainerRenderers(),
+		async execute(_toolCallId, params, signal, onUpdate, _ctx) {
 			const current = cfg;
 			if (!active || !current) {
 				throw new Error(
@@ -164,7 +166,58 @@ export default function (pi: ExtensionAPI) {
 			await ensureReady(current, () => active);
 
 			const timeout = params.timeout === undefined || params.timeout <= 0 ? DEFAULT_TIMEOUT : params.timeout;
-			const result = await runInContainer(current, { ...params, timeout }, undefined, signal);
+			// Stream the output into the tool row as it arrives, on the same
+			// throttle and tail bound pi's own shell tool uses. Without this the
+			// row stays blank for the whole command and a slow build is
+			// indistinguishable from a hung one.
+			const tail = new OutputTail();
+			let pending: ReturnType<typeof setTimeout> | undefined;
+			let lastEmit = 0;
+			let dirty = false;
+			const emit = () => {
+				dirty = false;
+				lastEmit = Date.now();
+				onUpdate?.({
+					content: [{ type: "text", text: tail.value() }],
+					details: tail.counts(),
+				});
+			};
+			const schedule = () => {
+				if (!onUpdate) return;
+				dirty = true;
+				const delay = UPDATE_THROTTLE_MS - (Date.now() - lastEmit);
+				if (delay <= 0) {
+					if (pending) {
+						clearTimeout(pending);
+						pending = undefined;
+					}
+					emit();
+					return;
+				}
+				pending ??= setTimeout(() => {
+					pending = undefined;
+					if (dirty) emit();
+				}, delay);
+			};
+			if (onUpdate) {
+				onUpdate({
+					content: [],
+					details: { containerCwd: current.remoteWorkspace ?? current.projectCwd } as DevcontainerDetails,
+				});
+			}
+			const result = await runInContainer(
+				current,
+				{ ...params, timeout },
+				(chunk) => {
+					tail.append(chunk.toString());
+					schedule();
+				},
+				signal,
+			);
+			if (pending) {
+				clearTimeout(pending);
+				pending = undefined;
+			}
 
 			if (result.failure === "aborted") throw new Error("aborted");
 			if (result.failure?.startsWith("timeout:")) {
@@ -190,7 +243,11 @@ export default function (pi: ExtensionAPI) {
 			if (result.exitCode !== 0) {
 				// A non-zero exit is an ordinary command outcome, not a broken
 				// container, so nothing is torn down — but the model must SEE it
-				// as a failure, which only throwing achieves.
+				// as a failure, which only throwing achieves. `details` cannot
+				// ride along on the error: the agent loop replaces a thrown tool
+				// error with `{content, details:{}}`, so the output has to be
+				// part of the message. The streamed updates have already shown
+				// it in the TUI by this point.
 				throw new Error(
 					`devcontainer command exited with code ${result.exitCode} (cwd ${result.containerCwd})\n${truncated.content}`,
 				);
@@ -198,6 +255,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text }],
 				details: {
+					...tail.counts(),
 					exitCode: result.exitCode,
 					containerCwd: result.containerCwd,
 					hostCwd: result.hostCwd,

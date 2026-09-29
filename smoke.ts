@@ -25,6 +25,7 @@ import { resolveToolCwd, runInContainer, settleBringUp } from "./run-in-containe
 import { shq } from "./exec.js";
 import { BASE_IMAGE, BASE_IMAGES, DOTNET_FEATURE, NODE_FEATURE, STACK_FEATURES, baseImageFor, featureFor, projectProfile, scaffold, stackIds } from "./scaffold.js";
 import { collectionsIn, featuresInCollection, loadCatalog, parseFeaturesPage, parseRef, publishedVersions, searchFeatures } from "./features-index.js";
+import { MAX_DISPLAY_BYTES_FOR_TEST, OutputTail } from "./render.js";
 import type { DevcontainerConfig } from "./types.js";
 
 let failures = 0;
@@ -559,6 +560,27 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		threw = e instanceof Error ? e.message : String(e);
 	}
 	checkTrue("an unknown collection is reported, not invented", threw.includes("no feature in the catalog"));
+}
+
+// --- streaming display tail --------------------------------------------
+// The live view is bounded so a chatty build cannot grow the TUI's memory
+// without limit, while the model still receives the full result separately.
+{
+	const tail = new OutputTail();
+	check("an empty tail reports no lines", tail.counts(), { totalLines: 0, totalBytes: 0 });
+	tail.append("one\ntwo");
+	check("lines are counted, not newlines", tail.counts(), { totalLines: 2, totalBytes: 7 });
+	tail.append("\n");
+	check("a trailing newline starts a new line", tail.counts(), { totalLines: 3, totalBytes: 8 });
+
+	// Overflow is cut on a line boundary: a view that starts mid-line reads as
+	// corrupt output rather than as truncation.
+	const big = new OutputTail();
+	const line = `${"x".repeat(99)}\n`;
+	for (let i = 0; i < 4000; i++) big.append(line);
+	checkTrue("the tail stays bounded", big.value().length <= MAX_DISPLAY_BYTES_FOR_TEST, big.value().length);
+	check("the retained lines are whole", big.value().split("\n").filter(Boolean).every((l) => l.length === 99), true);
+	check("line count agrees with the retained text", big.counts().totalLines, big.value().split("\n").filter(Boolean).length + 1);
 }
 
 console.log(failures === 0 ? `\nALL ${checks} CHECKS PASSED` : `\n${failures}/${checks} CHECKS FAILED`);
