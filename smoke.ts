@@ -511,6 +511,32 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	// The image each stack actually generates, which is what gets written.
 	const perStack = stackIds().map((id) => baseImageFor(id));
 	checkTrue("no two stacks share a base image", new Set(perStack).size >= 7, perStack.join(" "));
+
+	// ...and every tag in the list still resolves. This is the whole check:
+	// a renamed or deleted tag must fail here rather than on a user's first
+	// build. MCR needs no auth, so this stays two lines.
+	const MANIFEST_ACCEPT =
+		"application/vnd.docker.distribution.manifest.v2+json, " +
+		"application/vnd.oci.image.index.v1+json, " +
+		"application/vnd.docker.distribution.manifest.list.v2+json";
+	for (const { image } of BASE_IMAGES) {
+		const slash = image.indexOf("/");
+		const lastColon = image.lastIndexOf(":");
+		const repo = image.slice(slash + 1, lastColon);
+		const tag = image.slice(lastColon + 1);
+		let code = 0;
+		try {
+			const res = await fetch(`https://mcr.microsoft.com/v2/${repo}/manifests/${tag}`, {
+				headers: { Accept: MANIFEST_ACCEPT },
+			});
+			code = res.status;
+			await res.arrayBuffer();
+		} catch (e) {
+			checkTrue(`generated base image resolves: ${image}`, false, e instanceof Error ? e.message : String(e));
+			continue;
+		}
+		check(`generated base image resolves: ${image}`, code, 200);
+	}
 }
 
 // --- feature catalog (live) -------------------------------------------
