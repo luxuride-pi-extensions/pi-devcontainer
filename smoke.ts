@@ -24,7 +24,7 @@ import { provisionContainer } from "./provision.js";
 import { resolveToolCwd, runInContainer, settleBringUp } from "./run-in-container.js";
 import { shq } from "./exec.js";
 import { BASE_IMAGE, baseImageFor, featureFor, projectProfile, scaffold } from "./scaffold.js";
-import { parseCollectionIndex, repoSlug, searchCollections, listFeatures } from "./features-index.js";
+import { collectionsIn, featuresInCollection, loadCatalog, parseFeaturesPage, parseRef, searchFeatures } from "./features-index.js";
 import type { DevcontainerConfig } from "./types.js";
 
 let failures = 0;
@@ -42,13 +42,13 @@ function check(name: string, actual: unknown, expected: unknown) {
 	}
 }
 
-function checkTrue(name: string, cond: boolean) {
+function checkTrue(name: string, cond: boolean, ...detail: unknown[]) {
 	checks++;
 	if (cond) {
 		console.log(`ok   ${name}`);
 	} else {
 		failures++;
-		console.error(`FAIL ${name} (expected true)`);
+		console.error(`FAIL ${name} (expected true)${detail.length > 0 ? ` — got ${detail.join(", ")}` : ""}`);
 	}
 }
 
@@ -435,53 +435,85 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	}
 }
 
-// --- features index (parsing) ---------------------------------------
+// --- feature catalog (parsing) ---------------------------------------
 {
-	// Values in the real file contain colons (URLs, OCI references), so the
-	// parser must split on the first ": " only.
-	const yml = [
-		"- name: Reference Implementation Features",
-		"  maintainer: Dev Container Spec Maintainers",
-		"  contact: https://github.com/devcontainers/features/issues",
-		"  repository: https://github.com/devcontainers/features",
-		"  ociReference: ghcr.io/devcontainers/features",
-		"- name: \"Quoted: Name\"",
-		"  maintainer: Someone",
-		"  contact: https://example.com/x",
-		"  repository: https://example.com/x",
-		"  ociReference: ghcr.io/example/features",
-	].join("\n");
-	check("collection index parses", parseCollectionIndex(yml), [
-		{ name: "Reference Implementation Features", maintainer: "Dev Container Spec Maintainers", contact: "https://github.com/devcontainers/features/issues", repository: "https://github.com/devcontainers/features", ociReference: "ghcr.io/devcontainers/features" },
-		{ name: "Quoted: Name", maintainer: "Someone", contact: "https://example.com/x", repository: "https://example.com/x", ociReference: "ghcr.io/example/features" },
+	check("ref splits into collection and feature", parseRef("ghcr.io/devcontainers/features/node:1"), {
+		host: "ghcr.io",
+		collection: "ghcr.io/devcontainers/features",
+		feature: "node",
+		tag: "1",
+	});
+	// A handful of maintainers have capitalised path segments, so the pattern
+	// must not be lowercase-only.
+	checkTrue("uppercase owner is accepted", parseRef("ghcr.io/KusionStack/aws-cli:1") !== undefined);
+	checkTrue("a ref without a tag is rejected", parseRef("ghcr.io/devcontainers/features/node") === undefined);
+	checkTrue("a two-segment ref is rejected", parseRef("ghcr.io/devcontainers:1") === undefined);
+	// The rails collection has a four-segment path; dropping those rows would
+	// hide a whole collection from the model.
+	check("a four-segment path is a three-segment collection", parseRef("ghcr.io/rails/devcontainer/features/postgres-client:1"), {
+		host: "ghcr.io",
+		collection: "ghcr.io/rails/devcontainer/features",
+		feature: "postgres-client",
+		tag: "1",
+	});
+	checkTrue("a non-registry path is rejected", parseRef("some/path/feature:1") === undefined);
+
+	// Rows whose reference does not parse are dropped rather than handed to
+	// the model as if they were usable.
+	const page = [
+		"<table><tr><th>x</th></tr>",
+		'<tr><td><a href="/f/1">Node.js</a></td><td>Dev Container Spec Maintainers</td><td><code>ghcr.io/devcontainers/features/node:1</code></td><td><code>2.1.0</code></td></tr>',
+		'<tr><td><a href="/f/2">Broken</a></td><td>Someone</td><td><code>not a ref</code></td><td><code>1.0.0</code></td></tr>',
+		'<tr><td><a href="/f/3">Dupe</a></td><td>Someone</td><td><code>ghcr.io/a/b/c:2</code></td><td><code>1.0.0</code></td></tr>',
+		'<tr><td><a href="/f/4">Dupe</a></td><td>Someone</td><td><code>ghcr.io/a/b/c:2</code></td><td><code>1.0.0</code></td></tr>',
+		"</table>",
+	].join("");
+	check("page parses into catalog features", parseFeaturesPage(page), [
+		{ name: "Node.js", maintainer: "Dev Container Spec Maintainers", ref: "ghcr.io/devcontainers/features/node:1", version: "2.1.0" },
+		{ name: "Dupe", maintainer: "Someone", ref: "ghcr.io/a/b/c:2", version: "1.0.0" },
 	]);
-	check("ghcr reference to slug", repoSlug("ghcr.io/devcontainers/features"), "devcontainers/features");
-	check("trailing colon stripped", repoSlug("ghcr.io/example/features:"), "example/features");
+
+	const counts = collectionsIn(parseFeaturesPage(page));
+	check("collection counts group by collection", [...counts.entries()], [
+		["ghcr.io/devcontainers/features", 1],
+		["ghcr.io/a/b", 1],
+	]);
 }
 
-// --- features index (live network) -----------------------------------
+// --- feature catalog (live) -------------------------------------------
 {
-	// Start from a cold cache so the freshness assertions below are about
-	// this run and not about a previous one.
 	rmSync(join(homedir(), ".cache", "pi-devcontainer"), { recursive: true, force: true });
-	const found = await searchCollections("sql");
-	// The index is keyed on COLLECTION names, not feature names, so a search
-	// for a database finds the SQL/database collections; "postgres" itself
-	// appears in no collection name.
-	checkTrue("live search finds SQL collections", found.text.includes("Azure SQL Database"));
-	const listed = await listFeatures("ghcr.io/devcontainers/features");
-	checkTrue("live listing has rust", listed.text.includes("devcontainers/features:rust"));
-	checkTrue("live listing is not stale on first call", !listed.text.includes("[cached]"));
-	checkTrue("second call is cached", (await listFeatures("ghcr.io/devcontainers/features")).text.includes("[cached]"));
+	const cold = await loadCatalog();
+	checkTrue("live catalog has over a thousand features", cold.features.length > 1000);
+	checkTrue("live catalog is not served from cache", !cold.fromCache);
+	checkTrue("a second load is cached", (await loadCatalog()).fromCache);
+	// Every feature the catalog offers must carry a usable reference, or the
+	// model would paste something the devcontainer CLI rejects.
+	checkTrue("every live feature has a parseable ref", cold.features.every((f) => parseRef(f.ref) !== undefined));
+	// Every row the page offers must survive parsing, except the header.
+	checkTrue("no catalog row is dropped as malformed", cold.features.length > 1400, 1400, cold.features.length);
+
+	const postgres = await searchFeatures("postgres");
+	checkTrue("a community postgres feature is found", postgres.text.includes("postgres"));
+	// The whole point of the catalog over the collection index: a postgres
+	// feature exists in collections other than the reference one.
+	checkTrue("search reaches collections beyond the reference one", /devcontainer-features|devcontainer\/features|itsmechlark|rails/.test(postgres.text));
+
+	const pinned = await searchFeatures("ghcr.io/devcontainers/features/node:1");
+	checkTrue("an exact reference resolves", pinned.text.includes("ghcr.io/devcontainers/features/node:1"));
+	// A four-segment collection must be reachable, not silently dropped.
+	checkTrue("a four-segment collection is searchable", (await searchFeatures("ghcr.io/rails/devcontainer/features/postgres-client:1")).text.includes("postgres-client:1"));
+
+	const ref = await featuresInCollection("ghcr.io/devcontainers/features");
+	checkTrue("the reference collection lists rust", ref.text.includes("ghcr.io/devcontainers/features/rust:1"));
 	let threw = "";
 	try {
-		await listFeatures("not-a-reference");
+		await featuresInCollection("ghcr.io/nope/nothing");
 	} catch (e) {
 		threw = e instanceof Error ? e.message : String(e);
 	}
-	checkTrue("a malformed reference is rejected", threw.includes("expected something like"));
+	checkTrue("an unknown collection is reported, not invented", threw.includes("no feature in the catalog"));
 }
-
 
 console.log(failures === 0 ? `\nALL ${checks} CHECKS PASSED` : `\n${failures}/${checks} CHECKS FAILED`);
 process.exit(failures === 0 ? 0 : 1);

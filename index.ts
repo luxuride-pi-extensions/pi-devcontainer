@@ -69,7 +69,7 @@ import { run } from "./exec.js";
 import { loadGlobalOverride } from "./override.js";
 import { provisionContainer } from "./provision.js";
 import { ensureReady, runInContainer } from "./run-in-container.js";
-import { listFeatures, searchCollections } from "./features-index.js";
+import { collectionsIn, featuresInCollection, loadCatalog, searchFeatures, type CatalogFeature } from "./features-index.js";
 import { asJsonObject, parseJsonc } from "./jsonc.js";
 import { BASE_IMAGES, detectStack, projectProfile, scaffold } from "./scaffold.js";
 import type { DevcontainerConfig } from "./types.js";
@@ -97,7 +97,10 @@ export default function (pi: ExtensionAPI) {
 	// tool can act on the same directory without a second `ctx` from pi.
 	let sessionCwd: string | null = null;
 	// Fetched once per session on the config tool's first call.
-	let catalogPromise: Promise<{ collections: string; reference: string }> | null = null;
+	let catalogPromise: Promise<CatalogFeature[]> | null = null;
+	// Held out of the promise so a failure can be reported per call without
+	// re-awaiting an already-rejected promise on every later call.
+	let catalogFailure: string | null = null;
 
 	const notify = (msg: string, level: "info" | "warning" | "error") => {
 		if (!shuttingDown) lastUi?.notify?.(msg, level);
@@ -461,11 +464,13 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Create or edit this project's .devcontainer/devcontainer.json, choosing the base image and features yourself.",
 			"",
-			"Call it with NO arguments first: it reports the project's stack, the available base images and the feature collections, and writes nothing. Then call it again with the `image` and `features` you picked. Each call that supplies them rewrites the file and restarts the container, so you can refine it over several calls.",
+			"Call it with NO arguments first: it reports the project's stack, the available base images, and the devcontainer feature catalog, and writes nothing. Then call it again with the `image` and `features` you picked. Each call that supplies them rewrites the file and restarts the container, so you can refine it over several calls.",
 			"",
 			"If a config already exists, the file is updated in place and the current contents are shown — pass keys only for what you want to change. Omitting `features` keeps the existing ones, so pass `features: {}` to clear them.",
 			"",
 			"Parameters:",
+			"- `featureQuery` (optional): search the ~1440-feature catalog by name, e.g. \"postgres\". Returns real OCI references WITH their major tag, ready to paste. Nothing is written.",
+			"- `featureCollection` (optional): list every feature in one collection, e.g. \"ghcr.io/devcontainers/features\". Nothing is written.",
 			"- `image` (optional): base image reference.",
 			"- `features` (optional): devcontainer features. The key is the full OCI reference, the value holds the feature's options DIRECTLY — `{\"ghcr.io/devcontainers/features/node:1\": {\"version\": \"22\"}}`, not `{\"options\": {...}}`.",
 			"- `name` (optional): the container's display name.",
@@ -478,9 +483,15 @@ export default function (pi: ExtensionAPI) {
 		].join("\n"),
 		promptSnippet: "Create or edit this project's devcontainer config",
 		promptGuidelines: [
-			"Call `create_devcontainer` with no arguments first to see the project's stack, the available base images and the feature collections, then call it again with the image and features you chose. Do not guess OCI image or feature references.",
+			"Call `create_devcontainer` with no arguments first to see the project's stack, the available base images and the feature catalog, then call it again with the image and features you chose. Use `featureQuery` to search the catalog for a real feature reference. Do not guess OCI image or feature references.",
 		],
 		parameters: Type.Object({
+			featureQuery: Type.Optional(
+				Type.String({ description: "Search the feature catalog by name, e.g. \"postgres\". Returns OCI references with their major tag. Writes nothing." }),
+			),
+			featureCollection: Type.Optional(
+				Type.String({ description: "List all features in one collection, e.g. ghcr.io/devcontainers/features. Writes nothing." }),
+			),
 			image: Type.Optional(Type.String({ description: "Base image, e.g. mcr.microsoft.com/devcontainers/base:ubuntu" })),
 			features: Type.Optional(
 				Type.Record(Type.String(), Type.Object({}, { additionalProperties: true }), {
@@ -500,33 +511,36 @@ export default function (pi: ExtensionAPI) {
 			const bare = join(projectRoot, "devcontainer.json");
 			const existingPath = existsSync(target) ? target : existsSync(bare) ? bare : undefined;
 
-			// The index is fetched on the FIRST call of the session and reused
+			// The catalog is fetched on the FIRST call of the session and reused
 			// afterwards: a config is normally built over a few calls, and
-			// re-fetching a 300-entry catalog for each one would be wasteful.
-			if (!catalogPromise) {
-				catalogPromise = (async () => {
-					const [collections, reference] = await Promise.all([
-						searchCollections(""),
-						listFeatures("ghcr.io/devcontainers/features"),
-					]);
-					return { collections: collections.text, reference: reference.text };
-				})();
-			}
-			let catalog: { collections: string; reference: string };
+			// re-fetching 1440 features for each one would be wasteful.
+			if (!catalogPromise) catalogPromise = loadCatalog().then((r) => r.features);
+			let catalog: CatalogFeature[] | null;
 			try {
 				catalog = await catalogPromise;
 			} catch (err) {
 				// A lookup failure must not block writing a config: the model
 				// may already know what it wants.
-				catalog = {
-					collections: `(feature index unavailable: ${err instanceof Error ? err.message : String(err)})`,
-					reference: "",
-				};
+				catalog = null;
+				catalogFailure = err instanceof Error ? err.message : String(err);
 			}
 
 			// No arguments: report and change nothing.
 			const wantsWrite = params.image !== undefined || params.features !== undefined || params.name !== undefined || params.postCreateCommand !== undefined || params.forwardPorts !== undefined || params.stack !== undefined;
 			const profile = projectProfile(projectRoot);
+
+			// A targeted lookup: the model already knows what it wants, so skip
+			// the survey and answer the question directly.
+			if (params.featureQuery || params.featureCollection) {
+				const text = params.featureCollection
+					? (await featuresInCollection(params.featureCollection)).text
+					: (await searchFeatures(params.featureQuery ?? "")).text;
+				return {
+					content: [{ type: "text", text }],
+					details: { mode: "lookup", featureQuery: params.featureQuery, featureCollection: params.featureCollection } as Record<string, unknown>,
+				};
+			}
+
 			if (!wantsWrite) {
 				const text = [
 					`project: ${projectRoot}`,
@@ -538,17 +552,30 @@ export default function (pi: ExtensionAPI) {
 					"base images:",
 					...BASE_IMAGES.map((b) => `  ${b.image}  — ${b.for}`),
 					"",
-					`feature collections (${catalog.collections.split("\n")[0]}):`,
-					truncateTail(catalog.collections, { maxLines: 30 }).content,
-					"",
-					`reference collection features (${catalog.reference.split("\n")[0]}):`,
-					truncateTail(catalog.reference, { maxLines: 40 }).content,
-					"",
+					...(catalog
+						? [
+							"",
+							`feature collections (${collectionsIn(catalog).size} collections, ${catalog.length} features in the catalog):`,
+							[...collectionsIn(catalog).entries()]
+								.sort((a, b) => b[1] - a[1])
+								.slice(0, 25)
+								.map(([c, n]) => `  ${c}  (${n})`)
+								.join("\n"),
+							"",
+							"features in the reference collection:",
+							catalog
+								.filter((f) => f.ref.startsWith("ghcr.io/devcontainers/features/"))
+								.map((f) => `  ${f.ref}  ${f.name}`)
+								.join("\n"),
+							"",
+							"Call again with `featureQuery` (e.g. \"postgres\") to search the whole catalog, or `featureCollection` to list one collection.",
+						]
+						: ["", `feature catalog unavailable: ${catalogFailure}. Pass an image and features you already know, or retry later.`]),
 					existingPath
 						? "Call again with the `image`/`features` you want to change."
 						: "Call again with the `image` and `features` you want.",
 				].join("\n");
-				return { content: [{ type: "text", text }], details: { mode: "inspect", stack: profile.stack, image: profile.suggestedImage, path: existingPath } };
+				return { content: [{ type: "text", text }], details: { mode: "inspect", stack: profile.stack, image: profile.suggestedImage, path: existingPath } as Record<string, unknown> };
 			}
 
 			// Writing. An existing config is the base so an edit changes only
@@ -610,7 +637,7 @@ export default function (pi: ExtensionAPI) {
 						].join("\n"),
 					},
 				],
-				details: { mode: "write", path: target, stack: effectiveStack, image: String(config.image ?? "") },
+				details: { mode: "write", path: target, stack: effectiveStack, image: String(config.image ?? "") } as Record<string, unknown>,
 			};
 		},
 	});
