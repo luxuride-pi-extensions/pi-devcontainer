@@ -23,6 +23,7 @@ import { alreadyInContainer, loadDevcontainerJson } from "./config.js";
 import { provisionContainer } from "./provision.js";
 import { resolveToolCwd, runInContainer, settleBringUp } from "./run-in-container.js";
 import { shq } from "./exec.js";
+import { BASE_IMAGE, scaffold } from "./scaffold.js";
 import type { DevcontainerConfig } from "./types.js";
 
 let failures = 0;
@@ -354,6 +355,66 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		else process.env.HOME = prevHome;
 		rmSync(bin, { recursive: true, force: true });
 		rmSync(home, { recursive: true, force: true });
+	}
+}
+
+// --- scaffold ---------------------------------------------------------
+{
+	const proj = mkdtempSync(join(tmpdir(), "pi-dc-scaffold-"));
+	try {
+		writeFileSync(join(proj, "Cargo.toml"), "[package]\nname='x'\n");
+		writeFileSync(join(proj, "package.json"), JSON.stringify({ packageManager: "pnpm@9.1.0" }));
+		// Order encodes specificity: Cargo.toml beats package.json, and a
+		// project that is both Rust and Node is a Rust project.
+		check("rust beats node", scaffold({ projectRoot: proj }).stack, "rust");
+		check(
+			"rust config",
+			JSON.parse(scaffold({ projectRoot: proj }).text),
+			{ name: "Rust", image: BASE_IMAGE, features: { "ghcr.io/devcontainers/features/rust:1": {} } },
+		);
+
+		// A .NET project is usually a bare *.csproj with no global.json, so
+		// detection needs a directory scan; the file lives in a subdirectory,
+		// which must NOT count.
+		const proj2 = mkdtempSync(join(tmpdir(), "pi-dc-scaffold-"));
+		mkdirSync(join(proj2, "src"));
+		writeFileSync(join(proj2, "src", "App.csproj"), "<Project/>");
+		check("nested csproj is not detected", scaffold({ projectRoot: proj2 }).stack, "none");
+		writeFileSync(join(proj2, "App.csproj"), "<Project/>");
+		check("root csproj is detected", scaffold({ projectRoot: proj2 }).stack, "dotnet");
+
+		const proj3 = mkdtempSync(join(tmpdir(), "pi-dc-scaffold-"));
+		writeFileSync(join(proj3, "package.json"), JSON.stringify({ packageManager: "node@22.11.0" }));
+		// A wrong node version is the most common reason a scaffolded
+		// container builds on the host and fails in CI.
+		check(
+			"pinned node version is honored",
+			JSON.parse(scaffold({ projectRoot: proj3 }).text).features,
+			{ "ghcr.io/devcontainers/features/node:1": { version: "22", pnpmVersion: "latest", yarnVersion: "latest" } },
+		);
+
+		const full = JSON.parse(
+			scaffold({
+				projectRoot: proj,
+				stack: "python",
+				features: { "ghcr.io/devcontainers/features/postgres:1": { version: "16" } },
+				postCreateCommand: "pip install -e .",
+				forwardPorts: [8000, "5432:5432"],
+			}).text,
+		);
+		check("forced stack and extra features", full, {
+			name: "Python",
+			image: BASE_IMAGE,
+			features: {
+				"ghcr.io/devcontainers/features/python:1": {},
+				"ghcr.io/devcontainers/features/postgres:1": { version: "16" },
+			},
+			postCreateCommand: "pip install -e .",
+			forwardPorts: ["8000", "5432:5432"],
+		});
+		check("scaffold path is .devcontainer/devcontainer.json", scaffold({ projectRoot: proj }).path, join(proj, ".devcontainer", "devcontainer.json"));
+	} finally {
+		rmSync(proj, { recursive: true, force: true });
 	}
 }
 

@@ -21,8 +21,7 @@
  * If the PROJECT DIRECTORY ITSELF — and only that directory, no parent
  * search — contains `.devcontainer/devcontainer.json` (or `devcontainer.json`
  * directly, for backward compatibility) and pi is not already running
- * inside a devcontainer:
- *
+ * inside a devcontainer: *
  * - With the `devcontainer` CLI available, commands run via
  *   `devcontainer exec --workspace-folder <project> -- bash -c '<cmd>'`.
  *   `devcontainer up` is kicked off in the BACKGROUND at session start
@@ -39,13 +38,20 @@
  * Build-based devcontainers (no `image` field) require the devcontainer CLI;
  * without it the tool is never activated.
  *
+ * A second tool, `create_devcontainer`, writes a config for a project that
+ * has none: it detects the stack from marker files, writes an image-based
+ * devcontainer.json (base image plus a language feature, no Dockerfile),
+ * then re-runs detection so the run tool activates. It refuses to clobber
+ * an existing config unless asked to, in which case the old file is backed
+ * up.
+ *
  * Usage:
- * - `pi --no-devcontainer` - do not offer the tool for this run
+ * - `pi --no-devcontainer` - do not offer the tools for this run
  */
 
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
-import { basename, isAbsolute, resolve } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import {
 	defineTool,
@@ -61,9 +67,11 @@ import { run } from "./exec.js";
 import { loadGlobalOverride } from "./override.js";
 import { provisionContainer } from "./provision.js";
 import { ensureReady, runInContainer } from "./run-in-container.js";
+import { scaffold, stackIds } from "./scaffold.js";
 import type { DevcontainerConfig } from "./types.js";
 
 const TOOL_NAME = "devcontainer";
+const CREATE_TOOL_NAME = "create_devcontainer";
 const DEFAULT_TIMEOUT = 120;
 
 export default function (pi: ExtensionAPI) {
@@ -81,6 +89,9 @@ export default function (pi: ExtensionAPI) {
 	// failed to start, therefore never shows a tool it cannot serve.
 	let active = false;
 	let lastUi: ExtensionUIContext | null = null;
+	// The session's project directory, captured at session_start so the create
+	// tool can act on the same directory without a second `ctx` from pi.
+	let sessionCwd: string | null = null;
 
 	const notify = (msg: string, level: "info" | "warning" | "error") => {
 		if (!shuttingDown) lastUi?.notify?.(msg, level);
@@ -110,6 +121,8 @@ export default function (pi: ExtensionAPI) {
 			"",
 			"`bash` runs on the HOST. This tool runs in the CONTAINER. The two see different filesystems, so use this tool for anything that must be built, tested, installed or run by the container's toolchain (compilers, language runtimes, package managers, project commands).",
 			"",
+			"If this project has no devcontainer yet, create one with `create_devcontainer` first.",
+			"",
 			"Parameters:",
 			"- `command` (required): the shell command, run with `bash -c` (non-login: profile scripts do not run).",
 			"- `cwd` (optional): directory to run in, relative to the workspace root inside the container, or an absolute CONTAINER path. Omit it for the workspace root. A host path does not exist here; the result reports the host path of the directory actually used so `read`/`edit`/`write` can target the same files.",
@@ -136,7 +149,7 @@ export default function (pi: ExtensionAPI) {
 			const current = cfg;
 			if (!active || !current) {
 				throw new Error(
-					"the devcontainer is not available; run this command with `bash` on the host instead",
+					"this project has no devcontainer; create one with `create_devcontainer`, or run this command with `bash` on the host",
 				);
 			}
 			await ensureReady(current, () => active);
@@ -185,21 +198,22 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool(devcontainerTool);
-
-	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
-		lastUi = ctx.ui;
-		// Registered but not offered: pi records the tool set in the
-		// transcript's first system message, so leaving it active in a project
-		// with no devcontainer would advertise a command the model cannot use.
-		// Done at the very start of session_start, before any await, so it
-		// lands before the prompt is built.
+	/**
+	 * Detect the project's devcontainer and start bringing the container up.
+	 *
+	 * Extracted from the session_start handler so the create tool can re-run
+	 * the whole sequence after it writes a config: config discovery happens
+	 * once per call here, which is what makes scaffolding mid-session work.
+	 * Bring-up itself stays in the BACKGROUND (a first-run image pull can take
+	 * many minutes and must not block a tool call either), with the run
+	 * tool's first call awaiting cfg.pendingUp.
+	 */
+	const bringUp = async (projectDir: string) => {
+		cfg = null;
 		setToolActive(false);
 
 		if (pi.getFlag("no-devcontainer") === true) return;
-		if (alreadyInContainer()) return;
-
-		const { config, path, root } = loadDevcontainerJson(ctx.cwd);
+		const { config, path, root } = loadDevcontainerJson(projectDir);
 		if (!path) return; // no devcontainer in this project
 		if (!config) {
 			notify(`Devcontainer file exists but could not be parsed: ${path}`, "error");
@@ -207,7 +221,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const image = typeof config.image === "string" ? config.image : undefined;
-		const configRoot = root ?? ctx.cwd;
+		const configRoot = root ?? projectDir;
 		// The `workspaceFolder` config field (when set) names the folder to
 		// bind-mount; a relative value is resolved against the config's
 		// directory. Otherwise the config's directory is the workspace root.
@@ -228,14 +242,14 @@ export default function (pi: ExtensionAPI) {
 			declaredWorkspaceFolder = configRoot;
 		}
 		const useCli = await hasDevcontainerCli();
-		let canonicalCwd = ctx.cwd;
+		let canonicalCwd = projectDir;
 		try {
-			canonicalCwd = realpathSync(ctx.cwd);
+			canonicalCwd = realpathSync(projectDir);
 		} catch {
 			// fall back to the raw cwd
 		}
 		cfg = {
-			projectCwd: ctx.cwd,
+			projectCwd: projectDir,
 			canonicalCwd,
 			configRoot: canonicalCwd,
 			// Include a short hash of the canonical path: two projects sharing a
@@ -243,7 +257,7 @@ export default function (pi: ExtensionAPI) {
 			// on one container name, and `ensureDockerContainer` would happily
 			// `docker start` the OTHER project's container and run every
 			// command against the wrong mount.
-			containerName: `pi-devcontainer-${basename(ctx.cwd)}-${createHash("sha256").update(canonicalCwd).digest("hex").slice(0, 6)}`,
+			containerName: `pi-devcontainer-${basename(projectDir)}-${createHash("sha256").update(canonicalCwd).digest("hex").slice(0, 6)}`,
 			image,
 			// Overwritten below once the execution mode is known.
 			workspaceFolder: declaredWorkspaceFolder,
@@ -361,7 +375,6 @@ export default function (pi: ExtensionAPI) {
 						override.features,
 					);
 				}
-				setToolActive(true);
 				notify(
 					`Devcontainer ready: ${c.containerName} — the devcontainer tool runs commands with cwd ${c.remoteWorkspace ?? "(container default)"} (host: ${c.projectCwd})`,
 					"info",
@@ -388,13 +401,21 @@ export default function (pi: ExtensionAPI) {
 				if (override.provision && override.provision.length > 0) {
 					await provisionContainer(notify, ["docker", "exec", c.containerName], override.provision);
 				}
-				setToolActive(true);
 				notify(
 					`Devcontainer ready: ${c.containerName} — workspace mounted at ${c.workspaceFolder} (host paths stay valid)`,
 					"info",
 				);
 			})();
 		}
+
+		// Offered as soon as bring-up is STARTED, not when it finishes: the
+		// first tool call awaits cfg.pendingUp (see settleBringUp), so a
+		// pending image pull blocks the call rather than making the tool look
+		// unavailable. Withholding it until ready would make a freshly
+		// scaffolded project report "use bash on the host instead" for the
+		// whole pull, which is the exact confusion this extension exists to
+		// avoid.
+		setToolActive(true);
 
 		// Bring-up failures are reported here rather than left as an unhandled
 		// rejection: the background promise is awaited by the first tool call,
@@ -405,10 +426,130 @@ export default function (pi: ExtensionAPI) {
 		// catch below is watching the promise both of them created.
 		(cfg.pendingUp as Promise<void>).catch((err: unknown) => {
 			notify(
-				`devcontainer unavailable — the devcontainer tool will not be offered: ${err instanceof Error ? err.message : String(err)}`,
+				`devcontainer unavailable — commands run through the devcontainer tool will fail until this is fixed: ${err instanceof Error ? err.message : String(err)}`,
 				"error",
 			);
 		});
+	};
+
+	const createTool = defineTool({
+		name: CREATE_TOOL_NAME,
+		label: "Create devcontainer",
+		description: [
+			"Create a .devcontainer/devcontainer.json for the current project, then start the container and make the `devcontainer` run tool available.",
+			"",
+			"The project stack is detected from marker files in the project root (Cargo.toml, *.csproj, pyproject.toml, go.mod, package.json, CMakeLists.txt, pom.xml). The generated config is image-based: a maintained base image plus a language feature, with no Dockerfile.",
+			"",
+			"Refuses if a devcontainer.json already exists unless `overwrite: true` is passed, which backs the old file up to devcontainer.json.bak.",
+			"",
+			"Parameters:",
+			"- `stack` (optional): force a stack instead of detecting one. One of: " + stackIds().join(", ") + ".",
+			"- `features` (optional): extra devcontainer features, as `{\"ghcr.io/devcontainers/features/<name>:<version>\": {<options>}}`. Use for a toolchain the detected stack misses (a database, a language runtime, a CLI).",
+			"- `postCreateCommand` (optional): command to run once, after the container is created — e.g. `\"npm install\"`.",
+			"- `forwardPorts` (optional): host ports to forward, as numbers or \"host:container\" strings.",
+			"- `overwrite` (optional): replace an existing devcontainer.json, backing it up to devcontainer.json.bak.",
+			"",
+			"After creating, edit the generated file with the normal file tools if the project needs a Dockerfile (system packages) or other keys.",
+		].join("\n"),
+		promptSnippet: "Create a devcontainer config for this project",
+		promptGuidelines: [
+			"If a project has no devcontainer and its commands fail on the host for missing system dependencies, create one with `create_devcontainer` before using the `devcontainer` run tool.",
+		],
+		parameters: Type.Object({
+			stack: Type.Optional(
+				Type.String({
+					description: `Force a stack instead of detecting it: ${stackIds().join(", ")}`,
+				}),
+			),
+			features: Type.Optional(
+				Type.Record(Type.String(), Type.Object({}, { additionalProperties: true })),
+			),
+			postCreateCommand: Type.Optional(Type.String({ description: "Command to run once after the container is created" })),
+			forwardPorts: Type.Optional(
+				Type.Array(Type.Union([Type.Number(), Type.String()])),
+			),
+			overwrite: Type.Optional(
+				Type.Boolean({ description: "Replace an existing devcontainer.json (backs it up to devcontainer.json.bak)" }),
+			),
+		}),
+		renderShell: "default",
+		async execute(_toolCallId, params, signal) {
+			if (!sessionCwd) throw new Error("no project directory for this session");
+			const projectRoot = sessionCwd;
+			const target = join(projectRoot, ".devcontainer", "devcontainer.json");
+			const bare = join(projectRoot, "devcontainer.json");
+
+			if (!params.overwrite) {
+				const existing = existsSync(target) ? target : existsSync(bare) ? bare : undefined;
+				if (existing) {
+					throw new Error(
+						`a devcontainer config already exists at ${existing}; edit it directly, or pass overwrite: true to regenerate it (the old file is backed up to devcontainer.json.bak)`,
+					);
+				}
+			}
+
+			const result = scaffold({
+				projectRoot,
+				stack: params.stack,
+				features: params.features as Record<string, Record<string, unknown>> | undefined,
+				postCreateCommand: params.postCreateCommand,
+				forwardPorts: params.forwardPorts as (number | string)[] | undefined,
+			});
+			if (params.stack && result.stack === "none" && params.stack !== "none") {
+				throw new Error(`unknown stack "${params.stack}"; expected one of: ${stackIds().join(", ")}`);
+			}
+
+			// Back up BEFORE overwriting: the old config is the only record of
+			// hand-written settings (mounts, custom features, postCreate) that
+			// regeneration cannot infer from marker files.
+			if (params.overwrite) {
+				const from = existsSync(target) ? target : existsSync(bare) ? bare : undefined;
+				if (from) copyFileSync(from, `${from}.bak`);
+			}
+			mkdirSync(dirname(target), { recursive: true });
+			writeFileSync(target, result.text);
+
+			// Re-run detection so the run tool is offered for the project that
+			// now has a config. Bring-up is a background promise awaited by the
+			// first `devcontainer` call, so this returns immediately.
+			await bringUp(projectRoot);
+
+			notify(`Wrote ${target} (${result.stack} stack) — starting the devcontainer in the background`, "info");
+
+			if (signal?.aborted) throw new Error("aborted");
+			return {
+				content: [
+					{
+						type: "text",
+						text: [
+							`wrote: ${target}`,
+							`stack: ${result.stack}${params.stack ? " (forced)" : " (detected)"}`,
+							`features: ${result.features.length > 0 ? result.features.join(", ") : "(none)"}`,
+							"",
+							result.text.trimEnd(),
+						].join("\n"),
+					},
+				],
+				details: { path: target, stack: result.stack, features: result.features },
+			};
+		},
+	});
+
+	pi.registerTool(devcontainerTool);
+	pi.registerTool(createTool);
+
+	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+		lastUi = ctx.ui;
+		sessionCwd = ctx.cwd;
+		// Registered but not offered: pi records the tool set in the
+		// transcript's first system message, so leaving it active in a project
+		// with no devcontainer would advertise a command the model cannot use.
+		// Done at the very start of session_start, before any await, so it
+		// lands before the prompt is built.
+		setToolActive(false);
+
+		if (alreadyInContainer()) return;
+		await bringUp(ctx.cwd);
 	});
 
 	pi.on("session_shutdown", () => {
@@ -418,5 +559,6 @@ export default function (pi: ExtensionAPI) {
 		active = false;
 		cfg = null;
 		lastUi = null;
+		sessionCwd = null;
 	});
 }
