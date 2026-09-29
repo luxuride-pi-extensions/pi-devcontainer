@@ -23,8 +23,8 @@ import { alreadyInContainer, loadDevcontainerJson } from "./config.js";
 import { provisionContainer } from "./provision.js";
 import { resolveToolCwd, runInContainer, settleBringUp } from "./run-in-container.js";
 import { shq } from "./exec.js";
-import { BASE_IMAGE, baseImageFor, featureFor, projectProfile, scaffold } from "./scaffold.js";
-import { collectionsIn, featuresInCollection, loadCatalog, parseFeaturesPage, parseRef, searchFeatures } from "./features-index.js";
+import { BASE_IMAGE, BASE_IMAGES, DOTNET_FEATURE, NODE_FEATURE, STACK_FEATURES, baseImageFor, featureFor, projectProfile, scaffold, stackIds } from "./scaffold.js";
+import { collectionsIn, featuresInCollection, loadCatalog, parseFeaturesPage, parseRef, publishedVersions, searchFeatures } from "./features-index.js";
 import type { DevcontainerConfig } from "./types.js";
 
 let failures = 0;
@@ -391,7 +391,7 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		check(
 			"pinned node version is honored",
 			JSON.parse(scaffold({ projectRoot: proj3 }).text).features,
-			{ "ghcr.io/devcontainers/features/node:1": { version: "22", pnpmVersion: "latest", yarnVersion: "latest" } },
+			{ [NODE_FEATURE]: { version: "22", pnpmVersion: "latest", yarnVersion: "latest" } },
 		);
 
 		const full = JSON.parse(
@@ -480,6 +480,38 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	]);
 }
 
+// --- generated references must be REAL (live) ---------------------------
+// The curated BASE_IMAGES and STACK_FEATURES lists are the one part of this
+// extension that cannot be derived from a live source, and every entry that
+// was wrong produced a config that failed on the user's first build. These
+// checks make that a test failure here instead.
+//
+// The catalog is the authority for features; MCR is the authority for images.
+// Both are network calls, and a failure to reach either is reported rather
+// than silently passing.
+{
+	const { features } = await loadCatalog();
+	const catalogRefs = new Set(features.map((f) => f.ref));
+
+	for (const ref of STACK_FEATURES) {
+		checkTrue(`generated feature exists in the catalog: ${ref}`, catalogRefs.has(ref));
+	}
+
+	// cpp has no feature at all, so its stack must not name one.
+	check("cpp stack declares no feature", scaffold({ projectRoot: mkdtempSync(join(tmpdir(), "cpp-")), stack: "cpp" }).features, []);
+
+	// Every stack the tool offers must produce a base image; the empty-string
+	// case is what a forgotten switch arm would look like.
+	const images = new Set(BASE_IMAGES.map((b) => b.image));
+	for (const id of stackIds()) {
+		const image = baseImageFor(id);
+		checkTrue(`stack ${id} maps to a listed base image`, images.has(image), image);
+	}
+	// The image each stack actually generates, which is what gets written.
+	const perStack = stackIds().map((id) => baseImageFor(id));
+	checkTrue("no two stacks share a base image", new Set(perStack).size >= 7, perStack.join(" "));
+}
+
 // --- feature catalog (live) -------------------------------------------
 {
 	rmSync(join(homedir(), ".cache", "pi-devcontainer"), { recursive: true, force: true });
@@ -506,6 +538,20 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 
 	const ref = await featuresInCollection("ghcr.io/devcontainers/features");
 	checkTrue("the reference collection lists rust", ref.text.includes("ghcr.io/devcontainers/features/rust:1"));
+	// Every published major of a feature, not just the current one: a
+	// project on .NET 8 needs the older major, so listing only the newest
+	// would be an incomplete answer.
+	const versions = await publishedVersions("ghcr.io/devcontainers/features/node:1");
+	check("published majors, newest first", versions.versions.map((v) => v.tag), ["2", "1"]);
+	checkTrue("a version reports the feature's own version", versions.versions[0]!.version.startsWith("2"));
+	// dotnet:1 IS usable, and a project on .NET 8 needs it: the catalog would
+	// never surface it, which is the whole reason this lookup exists.
+	check("a superseded major is still reported", (await publishedVersions("ghcr.io/devcontainers/features/dotnet:2")).versions.map((v) => v.tag), ["2", "1"]);
+	// A reference with no tag at all names the same feature.
+	check("an untagged reference resolves the same feature", (await publishedVersions("ghcr.io/devcontainers/features/node")).versions.map((v) => v.tag), ["2", "1"]);
+	// cpp publishes nothing at all.
+	check("a feature with no published versions returns none", (await publishedVersions("ghcr.io/devcontainers/features/cpp:1")).versions, []);
+
 	let threw = "";
 	try {
 		await featuresInCollection("ghcr.io/nope/nothing");

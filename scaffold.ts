@@ -30,6 +30,14 @@ export const BASE_IMAGE = "mcr.microsoft.com/devcontainers/base:ubuntu";
  * gone away is caught immediately by the first build, whereas a hidden list
  * would leave the model inventing `node:20-slim` style tags that do not exist
  * for these images.
+ *
+ * Tags are chosen to be STABLE rather than newest. MCR publishes far more
+ * versions than a generated config should assume — dotnet reaches 10.0,
+ * java 25, typescript-node 26 — and defaulting every project to the newest
+ * would silently build it against a runtime it was never tested with. Each
+ * tag below is verified to resolve; the smoke tests re-check the ones that
+ * are cheapest to check, so a removed tag fails there rather than on a user's
+ * first build.
  */
 export const BASE_IMAGES: { image: string; for: string }[] = [
 	{ image: "mcr.microsoft.com/devcontainers/base:ubuntu", for: "nothing in particular; add features for what you need" },
@@ -38,12 +46,13 @@ export const BASE_IMAGES: { image: string; for: string }[] = [
 	{ image: "mcr.microsoft.com/devcontainers/universal:2", for: "multi-language: several runtimes in one image" },
 	{ image: "mcr.microsoft.com/devcontainers/typescript-node:22", for: "Node + TypeScript" },
 	{ image: "mcr.microsoft.com/devcontainers/python:3", for: "Python" },
-	{ image: "mcr.microsoft.com/devcontainers/dotnet:8", for: ".NET" },
+	{ image: "mcr.microsoft.com/devcontainers/dotnet:8.0", for: ".NET" },
 	{ image: "mcr.microsoft.com/devcontainers/java:21", for: "Java" },
 	{ image: "mcr.microsoft.com/devcontainers/go:1.23", for: "Go" },
 	{ image: "mcr.microsoft.com/devcontainers/php:8", for: "PHP" },
 	{ image: "mcr.microsoft.com/devcontainers/ruby:3.3", for: "Ruby" },
 	{ image: "mcr.microsoft.com/devcontainers/rust:1", for: "Rust" },
+	{ image: "mcr.microsoft.com/devcontainers/cpp:3", for: "C++ (no cpp feature is published; the image carries the toolchain)" },
 ];
 
 /** Base image suggested for a detected stack, or the neutral one. */
@@ -54,13 +63,15 @@ export function baseImageFor(stackId: string): string {
 		case "python":
 			return "mcr.microsoft.com/devcontainers/python:3";
 		case "dotnet":
-			return "mcr.microsoft.com/devcontainers/dotnet:8";
+			// MCR publishes no bare-major dotnet tags at all (dotnet:8 has
+			// never existed; the line is 8.0), so the patch level is required.
+			return "mcr.microsoft.com/devcontainers/dotnet:8.0";
 		case "java":
 			return "mcr.microsoft.com/devcontainers/java:21";
 		case "go":
 			return "mcr.microsoft.com/devcontainers/go:1.23";
 		case "cpp":
-			return "mcr.microsoft.com/devcontainers/base:ubuntu";
+			return "mcr.microsoft.com/devcontainers/cpp:3";
 		case "rust":
 			return "mcr.microsoft.com/devcontainers/rust:1";
 		default:
@@ -134,6 +145,18 @@ interface StackDef {
 	featureOptions?: Record<string, Record<string, unknown>>;
 }
 
+export const DOTNET_FEATURE = "ghcr.io/devcontainers/features/dotnet:2";
+export const NODE_FEATURE = "ghcr.io/devcontainers/features/node:2";
+/** Every feature the generated configs can name, for the catalog smoke check. */
+export const STACK_FEATURES = [
+	"ghcr.io/devcontainers/features/rust:1",
+	DOTNET_FEATURE,
+	"ghcr.io/devcontainers/features/python:1",
+	"ghcr.io/devcontainers/features/go:1",
+	NODE_FEATURE,
+	"ghcr.io/devcontainers/features/java:1",
+] as const;
+
 const DOTNET: StackDef = {
 	id: "dotnet",
 	label: ".NET",
@@ -141,7 +164,7 @@ const DOTNET: StackDef = {
 	// matched by hasCsharpProject below, since globbing a directory is not
 	// worth a dependency for one suffix check.
 	markers: ["global.json", "Directory.Build.props"],
-	features: ["ghcr.io/devcontainers/features/dotnet:1"],
+	features: [DOTNET_FEATURE],
 };
 
 const STACKS: StackDef[] = [
@@ -168,16 +191,19 @@ const STACKS: StackDef[] = [
 		id: "node",
 		label: "Node",
 		markers: ["package.json"],
-		features: ["ghcr.io/devcontainers/features/node:1"],
+		features: [NODE_FEATURE],
 		featureOptions: {
-			"ghcr.io/devcontainers/features/node:1": { version: "lts", pnpmVersion: "latest", yarnVersion: "latest" },
+			[NODE_FEATURE]: { version: "lts", pnpmVersion: "latest", yarnVersion: "latest" },
 		},
 	},
 	{
 		id: "cpp",
 		label: "C++",
 		markers: ["CMakeLists.txt", "meson.build", "conanfile.txt", "vcpkg.json"],
-		features: ["ghcr.io/devcontainers/features/cpp:1"],
+		// No feature: the reference collection publishes no `cpp` feature at
+		// all, so declaring one would write a reference that cannot be
+		// resolved. The language image carries the toolchain instead.
+		features: [],
 	},
 	{
 		id: "java",
@@ -246,9 +272,9 @@ export function scaffold(options: ScaffoldOptions): Scaffold {
 	}
 	// A pinned node version beats the stack default: the project's own
 	// packageManager field is the most authoritative signal available.
-	if (stack.id === "node" && features["ghcr.io/devcontainers/features/node:1"]) {
+	if (stack.id === "node" && features[NODE_FEATURE]) {
 		const pinned = nodeVersion(projectRoot);
-		if (pinned) features["ghcr.io/devcontainers/features/node:1"]!.version = pinned;
+		if (pinned) features[NODE_FEATURE]!.version = pinned;
 	}
 	// Caller-supplied features win over the detected ones, so a model can add
 	// a database or a language the marker files did not reveal.

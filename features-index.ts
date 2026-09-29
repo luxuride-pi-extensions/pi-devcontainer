@@ -238,3 +238,115 @@ export function collectionsIn(features: CatalogFeature[]): Map<string, number> {
 	}
 	return counts;
 }
+
+export interface PublishedVersion {
+	/** The major tag as written in a config, e.g. `2` for `node:2`. */
+	tag: string;
+	/** The feature's own version behind that tag, e.g. `2.1.0`. */
+	version: string;
+}
+
+/**
+ * Every published major version of one feature, newest first.
+ *
+ * The catalog only ever shows the CURRENT major, which is not enough to
+ * choose: a project on .NET 8 needs `dotnet:1` while a new one wants
+ * `dotnet:2`, and both are pullable. So the registry — not the catalog — is
+ * the authority on which majors exist.
+ *
+ * A tag list is not the whole truth either, so each major's manifest is
+ * fetched and its `dev.containers.metadata` read. A major that does not
+ * resolve, or resolves to something without feature metadata, is left out
+ * rather than reported and then failing someone's build — the same rule the
+ * catalog parser uses: a reference is only reported once it has been shown
+ * to resolve.
+ */
+export async function publishedVersions(reference: string): Promise<{ ref: string; versions: PublishedVersion[] }> {
+	// Both `ghcr.io/devcontainers/features/node` and `.../node:1` name the
+	// same feature, so any tag is dropped and a throwaway `:0` re-applied to
+	// satisfy parseRef. Only the tag goes; the feature segment must survive.
+	const ref = reference.trim().replace(/:\d+$/, "");
+	const parsed = parseRef(`${ref}:0`);
+	if (!parsed) {
+		throw new Error(
+			`"${reference}" is not a feature reference; expected something like ghcr.io/devcontainers/features/node:1`,
+		);
+	}
+	const repo = `${parsed.collection}/${parsed.feature}`;
+	const cacheKey = `feature-versions-${repo.replace(/[^a-z0-9.-]/gi, "_")}`;
+	const cached = readCache<PublishedVersion[]>(cacheKey);
+	if (cached && Date.now() - cached.fetchedAt <= TTL_MS) return { ref: repo, versions: cached.data };
+
+	const token = await registryToken(parsed.host);
+	const listed = (await (
+		await fetch(`https://${parsed.host}/v2/${repo}/tags/list?n=1000`, {
+			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+			headers: { authorization: `Bearer ${token}`, "user-agent": "pi-devcontainer-extension" },
+		})
+	).json()) as { tags?: string[] | null };
+	const majors = [...new Set((listed.tags ?? []).filter((t) => /^\d+$/.test(t)))].sort((a, b) => Number(b) - Number(a));
+
+	// Resolve each major concurrently; a major that does not resolve is not a
+	// usable reference, so it is left out instead of being reported and then
+	// failing someone's build. Note that `docker manifest inspect` cannot be
+	// used for this check: it rejects a single-platform feature manifest with
+	// "unsupported manifest format" even though the devcontainer CLI builds it
+	// without complaint.
+	const settled = await Promise.allSettled(majors.map((tag) => resolveFeatureVersion(parsed.host, repo, tag, token)));
+	const versions = settled
+		.filter((r): r is PromiseFulfilledResult<PublishedVersion> => r.status === "fulfilled")
+		.map((r) => r.value);
+	writeCache(cacheKey, versions);
+	return { ref: repo, versions };
+}
+
+async function registryToken(host: string): Promise<string> {
+	// ghcr.io's anonymous token endpoint; a different host may not need one,
+	// and a token it rejects is not fatal — the manifest fetch just proceeds.
+	const scope = encodeURIComponent(`repository:devcontainers/features:pull`);
+	try {
+		const res = await fetch(`https://${host}/token?scope=${scope}&service=${host}`, {
+			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+		});
+		if (!res.ok) return "";
+		const body = (await res.json()) as { token?: string };
+		return body.token ?? "";
+	} catch {
+		return "";
+	}
+}
+
+async function resolveFeatureVersion(host: string, repo: string, tag: string, token: string): Promise<PublishedVersion> {
+	const res = await fetch(`https://${host}/v2/${repo}/manifests/${tag}`, {
+		signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+		headers: {
+			...(token ? { authorization: `Bearer ${token}` } : {}),
+			accept: [
+				"application/vnd.oci.image.index.v1+json",
+				"application/vnd.docker.distribution.manifest.list.v2+json",
+				"application/vnd.oci.image.manifest.v1+json",
+				"application/vnd.docker.distribution.manifest.v2+json",
+			].join(","),
+			"user-agent": "pi-devcontainer-extension",
+		},
+	});
+	if (!res.ok) throw new Error(`manifest for ${repo}:${tag} -> HTTP ${res.status}`);
+	const manifest = (await res.json()) as Record<string, unknown>;
+	// A feature image carries `dev.containers.metadata` in its annotations.
+	// Both a flat OCI manifest (the reference collection's shape) and a
+	// multi-platform index may carry it; where only the index does, the
+	// per-platform manifests are not walked, and the major is reported
+	// without a version rather than with a guessed one.
+	const raw = readFeatureMetadata(manifest);
+	if (raw === undefined) throw new Error(`${repo}:${tag} carries no dev.containers.metadata`);
+	const parsedMeta = JSON.parse(raw) as { version?: string };
+	return { tag, version: parsedMeta.version ?? "(not declared)" };
+}
+
+function readFeatureMetadata(manifest: Record<string, unknown>): string | undefined {
+	const config = manifest.config as { annotations?: Record<string, string> } | undefined;
+	const fromConfig = config?.annotations?.["dev.containers.metadata"];
+	if (fromConfig) return fromConfig;
+	const annotations = manifest.annotations as Record<string, string> | undefined;
+	return annotations?.["dev.containers.metadata"];
+}

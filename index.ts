@@ -69,7 +69,7 @@ import { run } from "./exec.js";
 import { loadGlobalOverride } from "./override.js";
 import { provisionContainer } from "./provision.js";
 import { ensureReady, runInContainer } from "./run-in-container.js";
-import { collectionsIn, featuresInCollection, loadCatalog, searchFeatures, type CatalogFeature } from "./features-index.js";
+import { collectionsIn, featuresInCollection, loadCatalog, publishedVersions, searchFeatures, type CatalogFeature } from "./features-index.js";
 import { asJsonObject, parseJsonc } from "./jsonc.js";
 import { BASE_IMAGES, detectStack, projectProfile, scaffold } from "./scaffold.js";
 import type { DevcontainerConfig } from "./types.js";
@@ -471,6 +471,7 @@ export default function (pi: ExtensionAPI) {
 			"Parameters:",
 			"- `featureQuery` (optional): search the ~1440-feature catalog by name, e.g. \"postgres\". Returns real OCI references WITH their major tag, ready to paste. Nothing is written.",
 			"- `featureCollection` (optional): list every feature in one collection, e.g. \"ghcr.io/devcontainers/features\". Nothing is written.",
+			"- `featureVersions` (optional): list every PUBLISHED major version of one feature, newest first, e.g. \"ghcr.io/devcontainers/features/dotnet:2\" → shows whether :1 still exists. Only versions that actually resolve are reported. Nothing is written.",
 			"- `image` (optional): base image reference.",
 			"- `features` (optional): devcontainer features. The key is the full OCI reference, the value holds the feature's options DIRECTLY — `{\"ghcr.io/devcontainers/features/node:1\": {\"version\": \"22\"}}`, not `{\"options\": {...}}`.",
 			"- `name` (optional): the container's display name.",
@@ -491,6 +492,11 @@ export default function (pi: ExtensionAPI) {
 			),
 			featureCollection: Type.Optional(
 				Type.String({ description: "List all features in one collection, e.g. ghcr.io/devcontainers/features. Writes nothing." }),
+			),
+			featureVersions: Type.Optional(
+				Type.String({
+					description: "List all published major versions of one feature, e.g. ghcr.io/devcontainers/features/dotnet:2. Writes nothing.",
+				}),
 			),
 			image: Type.Optional(Type.String({ description: "Base image, e.g. mcr.microsoft.com/devcontainers/base:ubuntu" })),
 			features: Type.Optional(
@@ -531,6 +537,22 @@ export default function (pi: ExtensionAPI) {
 
 			// A targeted lookup: the model already knows what it wants, so skip
 			// the survey and answer the question directly.
+			if (params.featureVersions) {
+				const { ref, versions } = await publishedVersions(params.featureVersions);
+				const text =
+					versions.length === 0
+						? `${ref} has no published major version (the feature does not exist, or nothing behind it resolves).`
+						: [
+								`published major versions of ${ref}, newest first:`,
+								...versions.map((v) => `  ${ref}:${v.tag}  (feature version ${v.version})`),
+								"",
+								"Use the one matching what the project needs; a higher major is not automatically the right choice.",
+							].join("\n");
+				return {
+					content: [{ type: "text", text }],
+					details: { mode: "versions", featureVersions: params.featureVersions } as Record<string, unknown>,
+				};
+			}
 			if (params.featureQuery || params.featureCollection) {
 				const text = params.featureCollection
 					? (await featuresInCollection(params.featureCollection)).text
@@ -568,7 +590,7 @@ export default function (pi: ExtensionAPI) {
 								.map((f) => `  ${f.ref}  ${f.name}`)
 								.join("\n"),
 							"",
-							"Call again with `featureQuery` (e.g. \"postgres\") to search the whole catalog, or `featureCollection` to list one collection.",
+							"Call again with `featureQuery` (e.g. \"postgres\") to search the whole catalog, `featureCollection` to list one collection, or `featureVersions` to see which majors of a feature exist.",
 						]
 						: ["", `feature catalog unavailable: ${catalogFailure}. Pass an image and features you already know, or retry later.`]),
 					existingPath
