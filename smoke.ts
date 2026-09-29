@@ -5,11 +5,11 @@
  *
  * These cover the pure logic that is easy to break when moving code between
  * files: JSONC parsing (including the string-aware trailing-comma pass),
- * shell quoting, error classification, and config discovery.
+ * shell quoting, and config discovery.
  *
- * The cwd-translation tests are the important ones: they run the real
- * createContainerOps against a fake `devcontainer` on PATH, so the generated
- * `bash -lc '<command>'` string is asserted verbatim. That is where the
+ * The container-exec tests are the important ones: they run the real
+ * runInContainer against a fake `devcontainer` on PATH, so the generated
+ * `bash -c '<command>'` string is asserted verbatim. That is where the
  * literal `cd '$HOME'` bug lived, and a unit test of the helper alone would
  * not have caught it.
  */
@@ -19,10 +19,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { asJsonObject, parseJsonc } from "./jsonc.js";
-import { isProxyBreakError } from "./errors.js";
 import { alreadyInContainer, loadDevcontainerJson } from "./config.js";
-import { createContainerOps, settleBringUp } from "./container-ops.js";
 import { provisionContainer } from "./provision.js";
+import { resolveToolCwd, runInContainer, settleBringUp } from "./run-in-container.js";
 import { shq } from "./exec.js";
 import type { DevcontainerConfig } from "./types.js";
 
@@ -72,13 +71,6 @@ check("shq plain", shq("abc"), "'abc'");
 check("shq with spaces", shq("a b"), "'a b'");
 check("shq escapes single quote", shq("a'b"), "'a'\\''b'");
 
-// --- error classification ---------------------------------------------
-checkTrue("non-zero exit is NOT a break", !isProxyBreakError(new Error("Command exited with code 1")));
-checkTrue("timeout is NOT a break", !isProxyBreakError(new Error("timeout:30")));
-checkTrue("abort is NOT a break", !isProxyBreakError(new Error("aborted")));
-checkTrue("bring-up failure is NOT a break", !isProxyBreakError(new Error("devcontainer bring-up failed; proxy disabled")));
-checkTrue("spawn failure IS a break", isProxyBreakError(new Error("spawn devcontainer ENOENT")));
-
 checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "boolean");
 
 // --- config discovery --------------------------------------------------
@@ -119,22 +111,27 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 }
 
 // --- cwd translation (end-to-end through a fake devcontainer CLI) -------
-// The fake CLI prints its LAST argument, which is the `bash -lc '<script>'`
-// string createContainerOps built. Asserting that string verbatim is what
-// catches quoting regressions such as the literal `cd '$HOME'`.
+// The fake CLI prints its LAST argument, which is the `bash -c '<script>'`
+// string runInContainer built. Asserting that string verbatim is what
+// catches quoting regressions such as the literal `cd '$HOME'`, and asserting
+// the pair of returned paths is what keeps the two namespaces from blurring.
 {
 	const bin = mkdtempSync(join(tmpdir(), "dc-bin-"));
 	const realPath = process.env.PATH ?? "";
-	// NOTE: projectCwd must be a REAL directory. createContainerOps spawns with
+	// NOTE: projectCwd must be a REAL directory. runInContainer spawns with
 	// `cwd: cfg.projectCwd`, and node reports a nonexistent cwd as the same
 	// confusing `spawn devcontainer ENOENT` as a missing binary.
 	const projectCwd = mkdtempSync(join(tmpdir(), "dc-proj-"));
-	const outsideCwd = mkdtempSync(join(tmpdir(), "dc-outside-"));
 	mkdirSync(join(projectCwd, "sub", "dir"), { recursive: true });
 
 	const fake = join(bin, "devcontainer");
 	writeFileSync(fake, '#!/bin/sh\nfor last; do :; done\nprintf %s "$last"\nexit 0\n');
 	chmodSync(fake, 0o755);
+	// The docker fallback spawns `docker` instead, so it needs its own shim
+	// with identical behaviour or the test would be asserting ENOENT.
+	const fakeDocker = join(bin, "docker");
+	writeFileSync(fakeDocker, '#!/bin/sh\nfor last; do :; done\nprintf %s "$last"\nexit 0\n');
+	chmodSync(fakeDocker, 0o755);
 
 	const base = {
 		projectCwd,
@@ -146,85 +143,110 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		remoteWorkspace: "/workspaces/proj",
 	} satisfies Omit<DevcontainerConfig, "image" | "pendingUp">;
 
-	async function innerFor(cwd: string, overrides: Partial<DevcontainerConfig> = {}, env: NodeJS.ProcessEnv = {}) {
-		const warned: string[] = [];
-		const ops = createContainerOps({ ...base, ...overrides } as DevcontainerConfig, () => true, (w) =>
-			warned.push(w),
-		);
+	async function run(
+		params: { command?: string; cwd?: string; stdin?: string },
+		overrides: Partial<DevcontainerConfig> = {},
+	) {
 		const out: Buffer[] = [];
 		const prevPath = process.env.PATH;
 		process.env.PATH = `${bin}:${realPath}`;
 		try {
-			// createContainerOps spawns `detached: true` + unref'd, so a lost
+			// runInContainer spawns `detached: true` + unref'd, so a lost
 			// 'close' event would leave this promise pending forever and node
 			// would exit with an "unsettled top-level await" instead of a useful
 			// failure. Bound every call so a regression reports which one it was.
-			const label = `cwd ${cwd} ${JSON.stringify(overrides)}`;
+			const label = `${JSON.stringify(params)} ${JSON.stringify(overrides)}`;
 			const res = await Promise.race([
-				ops.exec("echo hi", cwd, { onData: (d) => out.push(Buffer.from(d)), env }),
+				runInContainer({ ...base, ...overrides } as DevcontainerConfig, { command: "echo hi", ...params }),
 				new Promise<never>((_, reject) =>
-					setTimeout(() => reject(new Error(`exec never settled: ${label}`)), 5000),
+					setTimeout(() => reject(new Error(`run never settled: ${label}`)), 5000),
 				),
 			]);
 			check(`exit code 0 for ${label}`, res.exitCode, 0);
+			return res;
 		} finally {
 			process.env.PATH = prevPath;
 		}
-		return { script: Buffer.concat(out).toString(), warned };
 	}
 
 	try {
-		const root = await innerFor(projectCwd);
-		check(
-			"project cwd cds to the mount",
-			root.script.includes(`cd '/workspaces/proj' && echo hi`),
-			true,
-		);
-		checkTrue("project cwd emits PI_HOST_CWD", root.script.includes("PI_HOST_CWD='"));
-		checkTrue("project cwd emits PI_DEVCONTAINER_WORKSPACE", root.script.includes("PI_DEVCONTAINER_WORKSPACE='/workspaces/proj'"));
-		check("no warning for in-mount cwd", root.warned.length, 0);
+		// Omitted cwd: the container-side mount, reported with the host
+		// directory it corresponds to, so file tools can follow.
+		const root = await run({});
+		check("default cwd is the container mount", root.containerCwd, "/workspaces/proj");
+		check("default cwd reports the host project dir", root.hostCwd, projectCwd);
+		check("default cds to the mount", root.output, "cd '/workspaces/proj' && echo hi");
 
-		const sub = await innerFor(join(projectCwd, "sub", "dir"));
-		check(
-			"subdirectory is appended to the mount",
-			sub.script.includes("cd '/workspaces/proj/sub/dir' && echo hi"),
-			true,
-		);
-		check("no warning for in-mount subdir", sub.warned.length, 0);
+		const sub = await run({ cwd: "sub/dir" });
+		check("relative cwd resolves inside the container", sub.containerCwd, "/workspaces/proj/sub/dir");
+		check("relative cwd reports the host dir", sub.hostCwd, join(projectCwd, "sub", "dir"));
+		check("relative cwd cds to the resolved dir", sub.output, "cd '/workspaces/proj/sub/dir' && echo hi");
 
-		// A host path that does not exist in the container must be re-based
-		// onto the mount root and reported, not passed through.
-		const outside = await innerFor(outsideCwd);
-		check("outside cwd re-based onto mount root", outside.script.includes("cd '/workspaces/proj' && echo hi"), true);
-		check("outside cwd warns once", outside.warned, [outsideCwd]);
+		// An absolute path is a CONTAINER path, passed through untouched.
+		const abs = await run({ cwd: "/etc" });
+		check("absolute cwd taken at face value", abs.containerCwd, "/etc");
+		check("out-of-mount absolute cwd has no host counterpart claim", abs.hostCwd, "/etc");
 
-		// THE REGRESSION GUARD: with no resolved mount point the extension
-		// must emit no `cd` at all. It used to emit `cd '$HOME'`, which bash
-		// treated as a literal directory and failed on every command.
-		const noMount = await innerFor(projectCwd, { remoteWorkspace: undefined });
-		checkTrue("no mount point emits no cd", !noMount.script.includes("cd "));
-		checkTrue("no mount point still exports PI_HOST_CWD", noMount.script.includes("PI_HOST_CWD='"));
-		checkTrue(
-			"no mount point omits PI_DEVCONTAINER_WORKSPACE",
-			!noMount.script.includes("PI_DEVCONTAINER_WORKSPACE"),
-		);
-		checkTrue("no literal $HOME cd", !noMount.script.includes("$HOME"));
+		// THE REGRESSION GUARD: an empty cwd must never become `cd '$HOME'` or
+		// any other invented directory — it is either the resolved mount or a
+		// hard error.
+		let noMountErr = "";
+		try {
+			await run({ cwd: "sub" }, { remoteWorkspace: undefined });
+		} catch (err) {
+			noMountErr = err instanceof Error ? err.message : String(err);
+		}
+		checkTrue("relative cwd without a known mount is rejected", noMountErr.includes("mount point is unknown"));
+		checkTrue("rejection never invents a cd", !noMountErr.includes("cd "));
 
-		// PI_* env from the tool is forwarded; other host env is not.
-		const envTest = await innerFor(projectCwd, {}, { PI_SESSION_ID: "abc", HOME: "/home/lux", PATH: "/usr/bin" });
-		checkTrue("PI_ env forwarded", envTest.script.includes("PI_SESSION_ID='abc'"));
-		checkTrue("host HOME not leaked", !envTest.script.includes("/home/lux'"));
+		// docker fallback: the workspace is mounted at its HOST path, so a
+		// relative cwd resolves against the project directory and host and
+		// container paths coincide.
+		const docker = await run({ cwd: "sub" }, { useCli: false, image: "alpine:3" });
+		check("docker fallback resolves against the project dir", docker.containerCwd, join(projectCwd, "sub"));
+		check("docker fallback host path equals container path", docker.hostCwd, join(projectCwd, "sub"));
 	} finally {
 		rmSync(bin, { recursive: true, force: true });
 		rmSync(projectCwd, { recursive: true, force: true });
-		rmSync(outsideCwd, { recursive: true, force: true });
+	}
+}
+
+// --- stdin is piped, not dropped ---------------------------------------
+// The fake CLI execs a real bash with the trailing args preserved, so the
+// `cat` really reads the pipe. Proving the bytes arrive needs a real process,
+// not an argv assertion.
+{
+	const bin = mkdtempSync(join(tmpdir(), "dc-stdin-bin-"));
+	const projectCwd = mkdtempSync(join(tmpdir(), "dc-stdin-proj-"));
+	const fake = join(bin, "devcontainer");
+	writeFileSync(fake, '#!/bin/sh\nwhile [ "$1" != "-c" ]; do shift; done\nshift\nexec /bin/bash -c "$1"\n');
+	chmodSync(fake, 0o755);
+	const prevPath = process.env.PATH;
+	process.env.PATH = `${bin}:${prevPath ?? ""}`;
+	try {
+		const cfg = {
+			projectCwd,
+			canonicalCwd: projectCwd,
+			configRoot: projectCwd,
+			containerName: "pi-devcontainer-proj",
+			workspaceFolder: projectCwd,
+			useCli: true,
+			remoteWorkspace: "/workspaces",
+		} as unknown as DevcontainerConfig;
+		// The container mount does not exist on the test host, so `cd` is
+		// expected to fail: only the stdin round trip is under test here.
+		const res = await runInContainer(cfg, { command: "cat", cwd: "/", stdin: "hello from stdin\n" });
+		check("stdin reaches the command", res.output.trim(), "hello from stdin");
+	} finally {
+		process.env.PATH = prevPath;
+		rmSync(bin, { recursive: true, force: true });
+		rmSync(projectCwd, { recursive: true, force: true });
 	}
 }
 
 // --- settleBringUp ----------------------------------------------------
-// Both command paths share one implementation, so the failure classification
-// cannot drift: the bash tool falls back to the LOCAL shell on failure, while
-// `!`/`!!` user bash reaches exec directly and must throw instead.
+// The tool awaits bring-up before its first call, and a failure must be
+// reported as a tool error rather than a container-less exec.
 {
 	// SAFETY: settleBringUp only ever reads cfg.pendingUp. A real
 	// DevcontainerConfig sits in exactly this state whenever the session is
@@ -251,8 +273,7 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	} catch (err) {
 		msg = err instanceof Error ? err.message : String(err);
 	}
-	check("settleBringUp throws on rejected up", msg, "devcontainer bring-up failed; proxy disabled");
-	checkTrue("bring-up throw is classified non-breaking", !isProxyBreakError(new Error(msg)));
+	check("settleBringUp throws on rejected up", msg, "devcontainer bring-up failed; the container is not available");
 }
 
 // --- provisioning marker keys on features too -------------------------
