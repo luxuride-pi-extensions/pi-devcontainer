@@ -20,6 +20,59 @@ import { join } from "node:path";
 /** Base image every generated config starts from. */
 export const BASE_IMAGE = "mcr.microsoft.com/devcontainers/base:ubuntu";
 
+/**
+ * Maintained base images, offered to the model as a choice rather than
+ * decided for it.
+ *
+ * The devcontainers site publishes an index of feature and template
+ * COLLECTIONS, but no machine-readable catalog of base images, so this list
+ * is curated and can lag. That is the right trade: an image name that has
+ * gone away is caught immediately by the first build, whereas a hidden list
+ * would leave the model inventing `node:20-slim` style tags that do not exist
+ * for these images.
+ */
+export const BASE_IMAGES: { image: string; for: string }[] = [
+	{ image: "mcr.microsoft.com/devcontainers/base:ubuntu", for: "nothing in particular; add features for what you need" },
+	{ image: "mcr.microsoft.com/devcontainers/base:debian", for: "as above, on Debian" },
+	{ image: "mcr.microsoft.com/devcontainers/base:alpine", for: "as above, on Alpine (musl — many wheels/binaries do not exist)" },
+	{ image: "mcr.microsoft.com/devcontainers/universal:2", for: "multi-language: several runtimes in one image" },
+	{ image: "mcr.microsoft.com/devcontainers/typescript-node:22", for: "Node + TypeScript" },
+	{ image: "mcr.microsoft.com/devcontainers/python:3", for: "Python" },
+	{ image: "mcr.microsoft.com/devcontainers/dotnet:8", for: ".NET" },
+	{ image: "mcr.microsoft.com/devcontainers/java:21", for: "Java" },
+	{ image: "mcr.microsoft.com/devcontainers/go:1.23", for: "Go" },
+	{ image: "mcr.microsoft.com/devcontainers/php:8", for: "PHP" },
+	{ image: "mcr.microsoft.com/devcontainers/ruby:3.3", for: "Ruby" },
+	{ image: "mcr.microsoft.com/devcontainers/rust:1", for: "Rust" },
+];
+
+/** Base image suggested for a detected stack, or the neutral one. */
+export function baseImageFor(stackId: string): string {
+	switch (stackId) {
+		case "node":
+			return "mcr.microsoft.com/devcontainers/typescript-node:22";
+		case "python":
+			return "mcr.microsoft.com/devcontainers/python:3";
+		case "dotnet":
+			return "mcr.microsoft.com/devcontainers/dotnet:8";
+		case "java":
+			return "mcr.microsoft.com/devcontainers/java:21";
+		case "go":
+			return "mcr.microsoft.com/devcontainers/go:1.23";
+		case "cpp":
+			return "mcr.microsoft.com/devcontainers/base:ubuntu";
+		case "rust":
+			return "mcr.microsoft.com/devcontainers/rust:1";
+		default:
+			return BASE_IMAGE;
+	}
+}
+
+/** The language feature id for a stack, if it has one. */
+export function featureFor(stackId: string): string | undefined {
+	return STACKS.find((s) => s.id === stackId)?.features[0];
+}
+
 export interface ScaffoldOptions {
 	/** Root of the project being scaffolded. */
 	projectRoot: string;
@@ -35,6 +88,10 @@ export interface ScaffoldOptions {
 	 * supplies these when the project needs a tool the default set misses.
 	 */
 	features?: Record<string, Record<string, unknown>>;
+	/** Base image, overriding the one implied by the stack. */
+	image?: string;
+	/** devcontainer name, overriding the one implied by the stack. */
+	name?: string;
 	/** Shell commands to run once, after the container is created. */
 	postCreateCommand?: string;
 	/** Host ports to forward, e.g. `[3000]` or `["3000:3000"]`. */
@@ -50,6 +107,8 @@ export interface Scaffold {
 	stack: string;
 	/** Feature ids written, so the model can see what it got. */
 	features: string[];
+	/** The assembled config, so the model can see the key/value pairs. */
+	config: Record<string, unknown>;
 }
 
 /**
@@ -198,8 +257,8 @@ export function scaffold(options: ScaffoldOptions): Scaffold {
 	}
 
 	const config: Record<string, unknown> = {
-		name: stack.label,
-		image: BASE_IMAGE,
+		name: options.name ?? stack.label,
+		image: options.image ?? baseImageFor(stack.id),
 	};
 	if (Object.keys(features).length > 0) config.features = features;
 	if (options.postCreateCommand) config.postCreateCommand = options.postCreateCommand;
@@ -208,10 +267,44 @@ export function scaffold(options: ScaffoldOptions): Scaffold {
 	}
 
 	const path = join(projectRoot, ".devcontainer", "devcontainer.json");
-	return { text: renderConfig(config), path, stack: stack.id, features: Object.keys(features) };
+	return { text: renderConfig(config), path, stack: stack.id, features: Object.keys(features), config };
 }
 
 /** Stack ids offered in the tool description, for error messages. */
 export function stackIds(): string[] {
 	return [...STACKS.map((s) => s.id), STACK_NONE.id];
+}
+
+export interface ProjectProfile {
+	/** Detected stack id, or "none". */
+	stack: string;
+	/** Marker files actually found in the project root, for the report. */
+	markers: string[];
+	/** Base image that fits the detected stack. */
+	suggestedImage: string;
+	/** Language feature id for the detected stack, if any. */
+	suggestedFeature?: string;
+	/** stack ids the model can force instead. */
+	stackOptions: string[];
+}
+
+/**
+ * Describe the project to the model so it can choose a base image and
+ * features. The marker list is reported verbatim so a mixed or monorepo
+ * project is visible: a root package.json next to services/go is not a Node
+ * project, and the model can see why.
+ */
+export function projectProfile(projectRoot: string): ProjectProfile {
+	const stack = detectStack(projectRoot);
+	const markers = STACKS.flatMap((s) =>
+		s.markers.filter((m) => existsSync(join(projectRoot, m))).map((m) => `${m} (${s.id})`),
+	);
+	if (hasCsharpProject(projectRoot)) markers.push("*.csproj (dotnet)");
+	return {
+		stack: stack.id,
+		markers,
+		suggestedImage: baseImageFor(stack.id),
+		suggestedFeature: featureFor(stack.id),
+		stackOptions: stackIds(),
+	};
 }

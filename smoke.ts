@@ -15,7 +15,7 @@
  */
 
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { asJsonObject, parseJsonc } from "./jsonc.js";
@@ -23,7 +23,8 @@ import { alreadyInContainer, loadDevcontainerJson } from "./config.js";
 import { provisionContainer } from "./provision.js";
 import { resolveToolCwd, runInContainer, settleBringUp } from "./run-in-container.js";
 import { shq } from "./exec.js";
-import { BASE_IMAGE, scaffold } from "./scaffold.js";
+import { BASE_IMAGE, baseImageFor, featureFor, projectProfile, scaffold } from "./scaffold.js";
+import { parseCollectionIndex, repoSlug, searchCollections, listFeatures } from "./features-index.js";
 import type { DevcontainerConfig } from "./types.js";
 
 let failures = 0;
@@ -370,7 +371,7 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		check(
 			"rust config",
 			JSON.parse(scaffold({ projectRoot: proj }).text),
-			{ name: "Rust", image: BASE_IMAGE, features: { "ghcr.io/devcontainers/features/rust:1": {} } },
+			{ name: "Rust", image: "mcr.microsoft.com/devcontainers/rust:1", features: { "ghcr.io/devcontainers/features/rust:1": {} } },
 		);
 
 		// A .NET project is usually a bare *.csproj with no global.json, so
@@ -404,7 +405,7 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		);
 		check("forced stack and extra features", full, {
 			name: "Python",
-			image: BASE_IMAGE,
+			image: "mcr.microsoft.com/devcontainers/python:3",
 			features: {
 				"ghcr.io/devcontainers/features/python:1": {},
 				"ghcr.io/devcontainers/features/postgres:1": { version: "16" },
@@ -412,11 +413,75 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 			postCreateCommand: "pip install -e .",
 			forwardPorts: ["8000", "5432:5432"],
 		});
+		// A devcontainer with a language-specific image beats base + feature:
+		// the image already carries the toolchain, and a feature on top of it
+		// is redundant work at build time.
+		check("rust gets the rust image", scaffold({ projectRoot: proj }).config.image, "mcr.microsoft.com/devcontainers/rust:1");
+		check("base image per stack", baseImageFor("python"), "mcr.microsoft.com/devcontainers/python:3");
+		check("unknown stack gets the neutral image", baseImageFor("nope"), BASE_IMAGE);
+		check("stack feature id", featureFor("go"), "ghcr.io/devcontainers/features/go:1");
+		check("no feature for a bare stack", featureFor("none"), undefined);
+		// The marker list is what lets the model see that a root package.json
+		// next to services/go is not a Node project.
+		const prof = projectProfile(proj);
+		check("profile stack", prof.stack, "rust");
+		check("profile lists every marker, not just the winner", prof.markers, ["Cargo.toml (rust)", "package.json (node)"]);
+		check("profile suggests the stack image", prof.suggestedImage, "mcr.microsoft.com/devcontainers/rust:1");
+		// An explicit image must override the stack default.
+		check("explicit image wins", scaffold({ projectRoot: proj, image: "my/image:1" }).config.image, "my/image:1");
 		check("scaffold path is .devcontainer/devcontainer.json", scaffold({ projectRoot: proj }).path, join(proj, ".devcontainer", "devcontainer.json"));
 	} finally {
 		rmSync(proj, { recursive: true, force: true });
 	}
 }
+
+// --- features index (parsing) ---------------------------------------
+{
+	// Values in the real file contain colons (URLs, OCI references), so the
+	// parser must split on the first ": " only.
+	const yml = [
+		"- name: Reference Implementation Features",
+		"  maintainer: Dev Container Spec Maintainers",
+		"  contact: https://github.com/devcontainers/features/issues",
+		"  repository: https://github.com/devcontainers/features",
+		"  ociReference: ghcr.io/devcontainers/features",
+		"- name: \"Quoted: Name\"",
+		"  maintainer: Someone",
+		"  contact: https://example.com/x",
+		"  repository: https://example.com/x",
+		"  ociReference: ghcr.io/example/features",
+	].join("\n");
+	check("collection index parses", parseCollectionIndex(yml), [
+		{ name: "Reference Implementation Features", maintainer: "Dev Container Spec Maintainers", contact: "https://github.com/devcontainers/features/issues", repository: "https://github.com/devcontainers/features", ociReference: "ghcr.io/devcontainers/features" },
+		{ name: "Quoted: Name", maintainer: "Someone", contact: "https://example.com/x", repository: "https://example.com/x", ociReference: "ghcr.io/example/features" },
+	]);
+	check("ghcr reference to slug", repoSlug("ghcr.io/devcontainers/features"), "devcontainers/features");
+	check("trailing colon stripped", repoSlug("ghcr.io/example/features:"), "example/features");
+}
+
+// --- features index (live network) -----------------------------------
+{
+	// Start from a cold cache so the freshness assertions below are about
+	// this run and not about a previous one.
+	rmSync(join(homedir(), ".cache", "pi-devcontainer"), { recursive: true, force: true });
+	const found = await searchCollections("sql");
+	// The index is keyed on COLLECTION names, not feature names, so a search
+	// for a database finds the SQL/database collections; "postgres" itself
+	// appears in no collection name.
+	checkTrue("live search finds SQL collections", found.text.includes("Azure SQL Database"));
+	const listed = await listFeatures("ghcr.io/devcontainers/features");
+	checkTrue("live listing has rust", listed.text.includes("devcontainers/features:rust"));
+	checkTrue("live listing is not stale on first call", !listed.text.includes("[cached]"));
+	checkTrue("second call is cached", (await listFeatures("ghcr.io/devcontainers/features")).text.includes("[cached]"));
+	let threw = "";
+	try {
+		await listFeatures("not-a-reference");
+	} catch (e) {
+		threw = e instanceof Error ? e.message : String(e);
+	}
+	checkTrue("a malformed reference is rejected", threw.includes("expected something like"));
+}
+
 
 console.log(failures === 0 ? `\nALL ${checks} CHECKS PASSED` : `\n${failures}/${checks} CHECKS FAILED`);
 process.exit(failures === 0 ? 0 : 1);

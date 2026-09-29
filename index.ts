@@ -38,18 +38,20 @@
  * Build-based devcontainers (no `image` field) require the devcontainer CLI;
  * without it the tool is never activated.
  *
- * A second tool, `create_devcontainer`, writes a config for a project that
- * has none: it detects the stack from marker files, writes an image-based
- * devcontainer.json (base image plus a language feature, no Dockerfile),
- * then re-runs detection so the run tool activates. It refuses to clobber
- * an existing config unless asked to, in which case the old file is backed
- * up.
+ * A second tool, `create_devcontainer`, creates or edits the config. It does
+ * not decide anything: the first call of a session reports the project's
+ * stack, the available base images and the feature collections (fetched from
+ * the published collection index, once per session) and writes nothing. The
+ * model then calls it again with the image and features it picked, and can
+ * call it repeatedly to refine them. Edits are applied in place on top of the
+ * existing config.
  *
  * Usage:
  * - `pi --no-devcontainer` - do not offer the tools for this run
  */
 
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { copyFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
@@ -67,7 +69,9 @@ import { run } from "./exec.js";
 import { loadGlobalOverride } from "./override.js";
 import { provisionContainer } from "./provision.js";
 import { ensureReady, runInContainer } from "./run-in-container.js";
-import { scaffold, stackIds } from "./scaffold.js";
+import { listFeatures, searchCollections } from "./features-index.js";
+import { asJsonObject, parseJsonc } from "./jsonc.js";
+import { BASE_IMAGES, detectStack, projectProfile, scaffold } from "./scaffold.js";
 import type { DevcontainerConfig } from "./types.js";
 
 const TOOL_NAME = "devcontainer";
@@ -92,6 +96,8 @@ export default function (pi: ExtensionAPI) {
 	// The session's project directory, captured at session_start so the create
 	// tool can act on the same directory without a second `ctx` from pi.
 	let sessionCwd: string | null = null;
+	// Fetched once per session on the config tool's first call.
+	let catalogPromise: Promise<{ collections: string; reference: string }> | null = null;
 
 	const notify = (msg: string, level: "info" | "warning" | "error") => {
 		if (!shuttingDown) lastUi?.notify?.(msg, level);
@@ -121,7 +127,7 @@ export default function (pi: ExtensionAPI) {
 			"",
 			"`bash` runs on the HOST. This tool runs in the CONTAINER. The two see different filesystems, so use this tool for anything that must be built, tested, installed or run by the container's toolchain (compilers, language runtimes, package managers, project commands).",
 			"",
-			"If this project has no devcontainer yet, create one with `create_devcontainer` first.",
+			"If this project has no devcontainer yet, create one with `create_devcontainer` first (call it with no arguments to see the available base images and features).",
 			"",
 			"Parameters:",
 			"- `command` (required): the shell command, run with `bash -c` (non-login: profile scripts do not run).",
@@ -432,45 +438,59 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
-	const createTool = defineTool({
+	/**
+	 * One tool for both creating and editing a devcontainer.
+	 *
+	 * The first call in a session reports the project, the base images and
+	 * the feature collections actually available, and writes nothing. The
+	 * model then calls it again with the image and features it chose; each
+	 * such call rewrites the config and restarts bring-up, so a config can be
+	 * built up across several calls instead of being committed to in one
+	 * guess. That split is deliberate: an image or a feature id that does not
+	 * exist is only discovered by a failed build, and a model that chose from
+	 * a live catalog is far less likely to invent one.
+	 *
+	 * Edits read the existing config first and apply only the keys passed, so
+	 * a second call with just a new feature keeps the image, name and ports
+	 * already set. Each write also backs the previous version up to
+	 * devcontainer.json.bak.
+	 */
+	const configTool = defineTool({
 		name: CREATE_TOOL_NAME,
-		label: "Create devcontainer",
+		label: "Devcontainer config",
 		description: [
-			"Create a .devcontainer/devcontainer.json for the current project, then start the container and make the `devcontainer` run tool available.",
+			"Create or edit this project's .devcontainer/devcontainer.json, choosing the base image and features yourself.",
 			"",
-			"The project stack is detected from marker files in the project root (Cargo.toml, *.csproj, pyproject.toml, go.mod, package.json, CMakeLists.txt, pom.xml). The generated config is image-based: a maintained base image plus a language feature, with no Dockerfile.",
+			"Call it with NO arguments first: it reports the project's stack, the available base images and the feature collections, and writes nothing. Then call it again with the `image` and `features` you picked. Each call that supplies them rewrites the file and restarts the container, so you can refine it over several calls.",
 			"",
-			"Refuses if a devcontainer.json already exists unless `overwrite: true` is passed, which backs the old file up to devcontainer.json.bak.",
+			"If a config already exists, the file is updated in place and the current contents are shown — pass keys only for what you want to change. Omitting `features` keeps the existing ones, so pass `features: {}` to clear them.",
 			"",
 			"Parameters:",
-			"- `stack` (optional): force a stack instead of detecting one. One of: " + stackIds().join(", ") + ".",
-			"- `features` (optional): extra devcontainer features, as `{\"ghcr.io/devcontainers/features/<name>:<version>\": {<options>}}`. Use for a toolchain the detected stack misses (a database, a language runtime, a CLI).",
-			"- `postCreateCommand` (optional): command to run once, after the container is created — e.g. `\"npm install\"`.",
-			"- `forwardPorts` (optional): host ports to forward, as numbers or \"host:container\" strings.",
-			"- `overwrite` (optional): replace an existing devcontainer.json, backing it up to devcontainer.json.bak.",
+			"- `image` (optional): base image reference.",
+			"- `features` (optional): devcontainer features. The key is the full OCI reference, the value holds the feature's options DIRECTLY — `{\"ghcr.io/devcontainers/features/node:1\": {\"version\": \"22\"}}`, not `{\"options\": {...}}`.",
+			"- `name` (optional): the container's display name.",
+			"- `postCreateCommand` (optional): command to run once after the container is created.",
+			"- `forwardPorts` (optional): host ports to forward.",
+			"- `stack` (optional): force the detected stack (affects only the defaults; an explicit `image`/`features` wins).",
 			"",
-			"After creating, edit the generated file with the normal file tools if the project needs a Dockerfile (system packages) or other keys.",
+			"Example: a Node project that also needs Postgres —",
+			"create_devcontainer(image: \"mcr.microsoft.com/devcontainers/typescript-node:22\", features: {\"ghcr.io/devcontainers/features/node:1\": {\"version\": \"22\"}, \"ghcr.io/devcontainers/features/postgres:1\": {\"version\": \"16\"}}, postCreateCommand: \"npm install\", forwardPorts: [5432])",
 		].join("\n"),
-		promptSnippet: "Create a devcontainer config for this project",
+		promptSnippet: "Create or edit this project's devcontainer config",
 		promptGuidelines: [
-			"If a project has no devcontainer and its commands fail on the host for missing system dependencies, create one with `create_devcontainer` before using the `devcontainer` run tool.",
+			"Call `create_devcontainer` with no arguments first to see the project's stack, the available base images and the feature collections, then call it again with the image and features you chose. Do not guess OCI image or feature references.",
 		],
 		parameters: Type.Object({
-			stack: Type.Optional(
-				Type.String({
-					description: `Force a stack instead of detecting it: ${stackIds().join(", ")}`,
+			image: Type.Optional(Type.String({ description: "Base image, e.g. mcr.microsoft.com/devcontainers/base:ubuntu" })),
+			features: Type.Optional(
+				Type.Record(Type.String(), Type.Object({}, { additionalProperties: true }), {
+					description: 'Features: keys are "<collection>/<feature>:<major>", values hold the options directly, e.g. {"ghcr.io/devcontainers/features/node:1": {"version": "22"}}. Omit to keep the existing ones, pass {} to clear them.',
 				}),
 			),
-			features: Type.Optional(
-				Type.Record(Type.String(), Type.Object({}, { additionalProperties: true })),
-			),
-			postCreateCommand: Type.Optional(Type.String({ description: "Command to run once after the container is created" })),
-			forwardPorts: Type.Optional(
-				Type.Array(Type.Union([Type.Number(), Type.String()])),
-			),
-			overwrite: Type.Optional(
-				Type.Boolean({ description: "Replace an existing devcontainer.json (backs it up to devcontainer.json.bak)" }),
-			),
+			name: Type.Optional(Type.String({ description: "Container display name" })),
+			postCreateCommand: Type.Optional(Type.String({ description: "Command run once after the container is created" })),
+			forwardPorts: Type.Optional(Type.Array(Type.Union([Type.Number(), Type.String()]))),
+			stack: Type.Optional(Type.String({ description: "Force the detected stack instead of using detection" })),
 		}),
 		renderShell: "default",
 		async execute(_toolCallId, params, signal) {
@@ -478,65 +498,125 @@ export default function (pi: ExtensionAPI) {
 			const projectRoot = sessionCwd;
 			const target = join(projectRoot, ".devcontainer", "devcontainer.json");
 			const bare = join(projectRoot, "devcontainer.json");
+			const existingPath = existsSync(target) ? target : existsSync(bare) ? bare : undefined;
 
-			if (!params.overwrite) {
-				const existing = existsSync(target) ? target : existsSync(bare) ? bare : undefined;
-				if (existing) {
-					throw new Error(
-						`a devcontainer config already exists at ${existing}; edit it directly, or pass overwrite: true to regenerate it (the old file is backed up to devcontainer.json.bak)`,
-					);
-				}
+			// The index is fetched on the FIRST call of the session and reused
+			// afterwards: a config is normally built over a few calls, and
+			// re-fetching a 300-entry catalog for each one would be wasteful.
+			if (!catalogPromise) {
+				catalogPromise = (async () => {
+					const [collections, reference] = await Promise.all([
+						searchCollections(""),
+						listFeatures("ghcr.io/devcontainers/features"),
+					]);
+					return { collections: collections.text, reference: reference.text };
+				})();
+			}
+			let catalog: { collections: string; reference: string };
+			try {
+				catalog = await catalogPromise;
+			} catch (err) {
+				// A lookup failure must not block writing a config: the model
+				// may already know what it wants.
+				catalog = {
+					collections: `(feature index unavailable: ${err instanceof Error ? err.message : String(err)})`,
+					reference: "",
+				};
 			}
 
-			const result = scaffold({
+			// No arguments: report and change nothing.
+			const wantsWrite = params.image !== undefined || params.features !== undefined || params.name !== undefined || params.postCreateCommand !== undefined || params.forwardPorts !== undefined || params.stack !== undefined;
+			const profile = projectProfile(projectRoot);
+			if (!wantsWrite) {
+				const text = [
+					`project: ${projectRoot}`,
+					`detected stack: ${profile.stack}${profile.markers.length > 0 ? ` (markers: ${profile.markers.join(", ")})` : " (no marker files in the project root)"}`,
+					`suggested for this stack: image ${profile.suggestedImage}${profile.suggestedFeature ? `, feature ${profile.suggestedFeature}:1` : ""}`,
+					`other stacks you can force: ${profile.stackOptions.join(", ")}`,
+					existingPath ? `existing config: ${existingPath}` : "no config yet",
+					"",
+					"base images:",
+					...BASE_IMAGES.map((b) => `  ${b.image}  — ${b.for}`),
+					"",
+					`feature collections (${catalog.collections.split("\n")[0]}):`,
+					truncateTail(catalog.collections, { maxLines: 30 }).content,
+					"",
+					`reference collection features (${catalog.reference.split("\n")[0]}):`,
+					truncateTail(catalog.reference, { maxLines: 40 }).content,
+					"",
+					existingPath
+						? "Call again with the `image`/`features` you want to change."
+						: "Call again with the `image` and `features` you want.",
+				].join("\n");
+				return { content: [{ type: "text", text }], details: { mode: "inspect", stack: profile.stack, image: profile.suggestedImage, path: existingPath } };
+			}
+
+			// Writing. An existing config is the base so an edit changes only
+			// the keys passed: the model is iterating, not replacing.
+			let base: Record<string, unknown> = {};
+			if (existingPath) {
+				try {
+					base = asJsonObject(parseJsonc(readFileSync(existingPath, "utf-8"))) ?? {};
+				} catch (err) {
+					throw new Error(`${existingPath} could not be parsed, refusing to overwrite it: ${err instanceof Error ? err.message : String(err)}`);
+				}
+			}
+			const stack = params.stack && !profile.stackOptions.includes(params.stack)
+				? undefined
+				: params.stack;
+			if (params.stack && stack === undefined) {
+				throw new Error(`unknown stack "${params.stack}"; expected one of: ${profile.stackOptions.join(", ")}`);
+			}
+			const detected = detectStack(projectRoot);
+			const effectiveStack = stack ?? detected.id;
+			const defaults = scaffold({
 				projectRoot,
-				stack: params.stack,
+				stack: effectiveStack,
 				features: params.features as Record<string, Record<string, unknown>> | undefined,
 				postCreateCommand: params.postCreateCommand,
 				forwardPorts: params.forwardPorts as (number | string)[] | undefined,
 			});
-			if (params.stack && result.stack === "none" && params.stack !== "none") {
-				throw new Error(`unknown stack "${params.stack}"; expected one of: ${stackIds().join(", ")}`);
-			}
+			const config: Record<string, unknown> = {
+				...base,
+				...defaults.config,
+				...(params.name ? { name: params.name } : {}),
+			};
+			// The base's own features survive an edit that does not mention
+			// any, which is the point of an in-place edit.
+			if (params.features === undefined && base.features) config.features = base.features;
 
-			// Back up BEFORE overwriting: the old config is the only record of
-			// hand-written settings (mounts, custom features, postCreate) that
-			// regeneration cannot infer from marker files.
-			if (params.overwrite) {
-				const from = existsSync(target) ? target : existsSync(bare) ? bare : undefined;
-				if (from) copyFileSync(from, `${from}.bak`);
-			}
+			if (existingPath) copyFileSync(existingPath, `${existingPath}.bak`);
 			mkdirSync(dirname(target), { recursive: true });
-			writeFileSync(target, result.text);
+			writeFileSync(target, `${JSON.stringify(config, null, 2)}\n`);
 
 			// Re-run detection so the run tool is offered for the project that
 			// now has a config. Bring-up is a background promise awaited by the
 			// first `devcontainer` call, so this returns immediately.
 			await bringUp(projectRoot);
-
-			notify(`Wrote ${target} (${result.stack} stack) — starting the devcontainer in the background`, "info");
-
 			if (signal?.aborted) throw new Error("aborted");
+			notify(`Updated ${target} — restarting the devcontainer in the background`, "info");
+
 			return {
 				content: [
 					{
 						type: "text",
 						text: [
-							`wrote: ${target}`,
-							`stack: ${result.stack}${params.stack ? " (forced)" : " (detected)"}`,
-							`features: ${result.features.length > 0 ? result.features.join(", ") : "(none)"}`,
+							`${existingPath ? "updated" : "wrote"}: ${target}`,
+							`stack: ${effectiveStack}${stack ? " (forced)" : existingPath ? " (detected; existing config preserved)" : " (detected)"}`,
+							`image: ${String(config.image)}`,
+							`features: ${Object.keys((config.features as Record<string, unknown>) ?? {}).join(", ") || "(none)"}`,
 							"",
-							result.text.trimEnd(),
+							JSON.stringify(config, null, 2),
 						].join("\n"),
 					},
 				],
-				details: { path: target, stack: result.stack, features: result.features },
+				details: { mode: "write", path: target, stack: effectiveStack, image: String(config.image ?? "") },
 			};
 		},
 	});
 
 	pi.registerTool(devcontainerTool);
-	pi.registerTool(createTool);
+	pi.registerTool(configTool);
 
 	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 		lastUi = ctx.ui;
