@@ -904,6 +904,59 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	// must exist before the first onProgress can schedule a tick through it.
 	const pendingDecl = execute.indexOf("let pending");
 	checkTrue("the throttle timer handle is declared before the wait", pendingDecl !== -1 && pendingDecl < wait, pendingDecl);
+	// The same mistake in the rebuild tool would reappear the moment it grew a
+	// progress callback, so the rule is checked for both waits.
+	const rebuild = source.slice(source.indexOf("name: REBUILD_TOOL_NAME"));
+	const rebuildWait = rebuild.indexOf("await ensureReady(");
+	checkTrue("the rebuild tool's wait was found", rebuildWait > 0, rebuildWait);
+	for (const decl of ["const schedule =", "const emit =", "let pending"]) {
+		checkTrue(`the rebuild tool declares ${decl} before its wait`, rebuild.indexOf(decl) !== -1 && rebuild.indexOf(decl) < rebuildWait, decl);
+	}
+}
+
+// --- rebuild_devcontainer: a rebuild is bring-up with an argument -------
+// The tool exists because a config edit does not always reach the container on
+// its own, and the fix has to be a re-run of `up` rather than a second,
+// parallel build path that would drift from it.
+{
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	checkTrue("the rebuild tool is registered", source.includes("pi.registerTool(rebuildTool)"), "registerTool(rebuildTool)");
+	// It has to ride the run tool's activation: a rebuild before the container
+	// is up would only report the same wait, worse.
+	checkTrue(
+		"the rebuild tool is activated with the run tool",
+		source.includes("pi.setActiveTools(\n\t\t\t\tnext ? [...names, TOOL_NAME, REBUILD_TOOL_NAME]") ||
+			source.includes("[...names, TOOL_NAME, REBUILD_TOOL_NAME]"),
+		"setActiveTools",
+	);
+	checkTrue(
+		"a deactivated rebuild tool is removed again",
+		source.includes("names.filter((n) => n !== TOOL_NAME && n !== REBUILD_TOOL_NAME)"),
+		"filter",
+	);
+	// extraArgs goes to the CLI verbatim rather than being modelled, so
+	// --no-cache works without a flag here.
+	const bringUp = source.slice(source.indexOf("const bringUp = async"), source.indexOf("const rebuildTool"));
+	checkTrue(
+		"extraArgs are appended to the up arguments",
+		/\["up", "--workspace-folder", wsFolder, \.\.\.extraArgs\]/.test(bringUp),
+		"upArgs",
+	);
+	checkTrue("bringUp accepts the extra arguments", bringUp.includes("extraArgs: string[] = []"), "signature");
+	// The refusal is the part that matters: two `up` processes against one
+	// container report each other's failures.
+	checkTrue("a rebuild refuses to stack on a running bring-up", source.includes("if (bringUpInFlight) {"), "bringUpInFlight");
+	checkTrue(
+		"the refusal explains why",
+		/a devcontainer bring-up is already running[\s\S]{0,200}Wait for it to finish/.test(source),
+		"message",
+	);
+	// The tool rebuilds before it waits, and refuses with a real reason when
+	// there is nothing to rebuild.
+	checkTrue("a missing config names the create tool", source.includes('create one with \\`${CREATE_TOOL_NAME}\\`'), "message");
+	// Split on whitespace, never shell-parsed: a quote has nothing to escape
+	// into, so it cannot smuggle in an extra argv entry.
+	checkTrue("extraArgs are split on whitespace, not shell-parsed", source.includes(".trim().split(/\\s+/)"), "split");
 }
 
 // --- docker access: share the host daemon by default, never nest -------

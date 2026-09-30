@@ -78,6 +78,7 @@ import type { DevcontainerConfig } from "./types.js";
 
 const TOOL_NAME = "devcontainer";
 const CREATE_TOOL_NAME = "create_devcontainer";
+const REBUILD_TOOL_NAME = "rebuild_devcontainer";
 const DEFAULT_TIMEOUT = 120;
 /**
  * How long one call waits for a still-running bring-up before reporting that
@@ -96,6 +97,11 @@ export default function (pi: ExtensionAPI) {
 
 	let cfg: DevcontainerConfig | null = null;
 	let shuttingDown = false;
+	// True from the moment bring-up starts until its promise settles. Separate
+	// from bringUpFinished because that one also reads true for a session that
+	// never brought anything up, and a rebuild must only refuse to stack on a
+	// bring-up that is actually running.
+	let bringUpInFlight = false;
 	// The tool is registered unconditionally (pi requires registration before
 	// setActiveTools can name it) but kept INACTIVE until the container is
 	// known to be up. A project with no devcontainer, or one whose container
@@ -119,13 +125,19 @@ export default function (pi: ExtensionAPI) {
 	// the next model request), so each transition is guarded to run once and
 	// never during shutdown. A session that refuses the change still works:
 	// `execute` checks `active` itself and fails loudly.
+	// The active tool set is a set, so the rebuild tool rides along with the
+	// run tool: there is nothing to bring up until the container is up, and
+	// offering a rebuild then would only report the same wait the run tool
+	// reports better.
 	const setToolActive = (next: boolean) => {
 		if (active === next) return;
 		active = next;
 		if (shuttingDown) return;
 		try {
 			const names = pi.getActiveTools();
-			pi.setActiveTools(next ? [...names, TOOL_NAME] : names.filter((n) => n !== TOOL_NAME));
+			pi.setActiveTools(
+				next ? [...names, TOOL_NAME, REBUILD_TOOL_NAME] : names.filter((n) => n !== TOOL_NAME && n !== REBUILD_TOOL_NAME),
+			);
 		} catch {
 			// `active` is the real gate
 		}
@@ -335,8 +347,9 @@ export default function (pi: ExtensionAPI) {
 	 * many minutes and must not block a tool call either), with the run
 	 * tool's first call awaiting cfg.pendingUp.
 	 */
-	const bringUp = async (projectDir: string) => {
+	const bringUp = async (projectDir: string, extraArgs: string[] = []) => {
 		cfg = null;
+		bringUpInFlight = false;
 		setToolActive(false);
 
 		if (pi.getFlag("no-devcontainer") === true) return;
@@ -428,7 +441,10 @@ export default function (pi: ExtensionAPI) {
 			// /home/... vs /var/home/...) ends up mounted from the wrong
 			// host directory, hence canonicalization.
 			const wsFolder = cfg.configRoot;
-			const upArgs = ["up", "--workspace-folder", wsFolder];
+			// Anything the rebuild tool was given is appended to `up` verbatim,
+			// so `--no-cache` reaches the CLI without this extension having to
+			// model a flag set that grows with every CLI release.
+			const upArgs = ["up", "--workspace-folder", wsFolder, ...extraArgs];
 			if (override.features && Object.keys(override.features).length > 0) {
 				upArgs.push("--additional-features", JSON.stringify(override.features));
 			}
@@ -545,6 +561,7 @@ export default function (pi: ExtensionAPI) {
 		// cfg.pendingUp (see settleBringUp), so a pending image pull blocks
 		// the call rather than making the tool look unavailable.
 		setToolActive(true);
+		bringUpInFlight = true;
 
 		// Both branches above assign `c.pendingUp`, and `c` is the same object
 		// `cfg` points at. A session that never calls the tool would otherwise
@@ -567,6 +584,7 @@ export default function (pi: ExtensionAPI) {
 		// on both outcomes — which is what /devcontainer polls for.
 		}).then(() => {
 			bringUpFinished = true;
+			bringUpInFlight = false;
 		});
 
 		return cfg.pendingUp;
@@ -810,7 +828,146 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	/**
+	 * Rebuild the image from the config as it stands now.
+	 *
+	 * The escape hatch for an edit the bring-up did not pick up: a Dockerfile
+	 * or compose file the config references, a feature the author pinned by
+	 * hand, or a layer the CLI cached that is now wrong. A rebuild is `devcontainer
+	 * up` again from a clean slate, so the argument is passed straight through
+	 * rather than modelled — `--no-cache` and a future flag both work without a
+	 * change here.
+	 */
+	const rebuildTool = defineTool({
+		name: REBUILD_TOOL_NAME,
+		label: "Rebuild devcontainer",
+		description: [
+			"Rebuild this project's devcontainer image from its current config.",
+			"",
+			"Use this after editing anything the image is built from — devcontainer.json, a `dockerFile`, a compose file — when you need the container to actually pick the change up. It re-runs `devcontainer up` in the BACKGROUND, exactly as the session start does, so it can take as long as a first-run pull; the progress streams into this tool row and the devcontainer tool activates again when the container is up.",
+			"",
+			"A rebuild while one is already running is refused rather than stacked, because two `up` processes against one container would report each other's failures.",
+			"",
+			"Parameters:",
+			"- `extraArgs` (optional): arguments appended to `devcontainer up` verbatim, e.g. \"--no-cache\" or \"--remove-existing-container\". Omit it for a normal rebuild. Anything invalid is rejected by the CLI, with its own message.",
+			"- `waitForContainer` (optional): seconds to wait for the rebuild to finish before reporting that it is still running (default 90). It keeps running either way; call again with a larger number rather than treating that as a failure."
+		].join("\n"),
+		promptSnippet: "Rebuild this project's devcontainer image from its config",
+		promptGuidelines: [
+			"After editing `.devcontainer/devcontainer.json`, a `dockerFile` or a compose file, call `rebuild_devcontainer` so the running container matches the change.",
+		],
+		parameters: Type.Object({
+			extraArgs: Type.Optional(
+				Type.String({
+					description: 'Arguments appended to `devcontainer up` verbatim, e.g. "--no-cache". Omit for a normal rebuild.',
+				}),
+			),
+			waitForContainer: Type.Optional(
+				Type.Number({
+					description: "Seconds to wait for the rebuild before reporting that it is still running (default 90).",
+				}),
+			),
+		}),
+		renderShell: "default",
+		...createDevcontainerRenderers(),
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const projectDir = sessionCwd;
+			if (!projectDir) throw new Error("no session directory to rebuild; this tool only works inside a project session");
+			const { path } = loadDevcontainerJson(projectDir);
+			if (!path) {
+				throw new Error(
+					`no .devcontainer/devcontainer.json in ${projectDir}; create one with \`${CREATE_TOOL_NAME}\` first — there is nothing to rebuild`,
+				);
+			}
+			if (bringUpInFlight) {
+				throw new Error(
+					"a devcontainer bring-up is already running for this project; a second `up` would race it for the same container. Wait for it to finish — call this again once the devcontainer tool reports the container is up.",
+				);
+			}
+			// Split on whitespace rather than shell-parsing: these become
+			// separate argv entries, so a quote in the text has nothing to
+			// escape into and cannot smuggle an extra argument.
+			const extraArgs = (params.extraArgs ?? "").trim() ? (params.extraArgs as string).trim().split(/\s+/) : [];
+
+			// The row is created and its first update emitted BEFORE the wait, and
+			// the throttle handle is declared before it too — onProgress fires from
+			// inside ensureReady, and a `const` declared later is in its temporal
+			// dead zone until then, which would throw out of the callback.
+			const tail = new OutputTail();
+			let pending: ReturnType<typeof setTimeout> | undefined;
+			let lastEmit = 0;
+			let dirty = false;
+			const emit = () => {
+				if (!onUpdate) return;
+				lastEmit = Date.now();
+				dirty = false;
+				onUpdate({ content: [{ type: "text", text: tail.value() }], details: tail.counts() });
+			};
+			const schedule = () => {
+				if (!onUpdate) return;
+				dirty = true;
+				const delay = Math.max(0, UPDATE_THROTTLE_MS - (Date.now() - lastEmit));
+				if (delay <= 0) {
+					if (pending) {
+						clearTimeout(pending);
+						pending = undefined;
+					}
+					emit();
+					return;
+				}
+				if (pending) return;
+				pending = setTimeout(() => {
+					pending = undefined;
+					if (dirty) emit();
+				}, delay);
+			};
+			if (onUpdate) {
+				onUpdate({
+					content: [{ type: "text", text: `rebuilding from ${path}${extraArgs.length > 0 ? ` (${extraArgs.join(" ")})` : ""}…\n` }],
+					details: tail.counts(),
+				});
+			}
+			await bringUp(projectDir, extraArgs);
+			await ensureReady(cfg as DevcontainerConfig, {
+				isEnabled: () => active,
+				onProgress: (line) => {
+					tail.append(line);
+					schedule();
+				},
+				signal,
+				ui: ctx?.ui,
+				waitBudgetSeconds:
+					params.waitForContainer === undefined || params.waitForContainer <= 0 ? DEFAULT_WAIT_FOR_CONTAINER : params.waitForContainer,
+			});
+			// The pull log leaves the row once the rebuild itself is done.
+			tail.reset();
+			if (onUpdate) {
+				onUpdate({
+					content: [{ type: "text", text: `rebuilt from ${path}${extraArgs.length > 0 ? ` (${extraArgs.join(" ")})` : ""}\n` }],
+					details: tail.counts(),
+				});
+			}
+			const ready = cfg;
+			return {
+				content: [
+					{
+						type: "text",
+						text: [
+							`rebuilt: ${path}`,
+							`container: ${ready?.containerName ?? "(unknown)"}`,
+							`workspace: ${ready?.remoteWorkspace ?? ready?.workspaceFolder ?? "(container default)"}`,
+							"",
+							`Run commands in it with the \`${TOOL_NAME}\` tool.`,
+						].join("\n"),
+					},
+				],
+				details: { mode: "rebuild", path, extraArgs } as Record<string, unknown>,
+			};
+		},
+	});
+
 	pi.registerTool(devcontainerTool);
+	pi.registerTool(rebuildTool);
 	pi.registerTool(configTool);
 
 	// The bring-up log, for the slash command. Kept in the same module scope
