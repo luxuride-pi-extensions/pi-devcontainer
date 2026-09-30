@@ -1,7 +1,7 @@
 import type { DevcontainerConfig } from "./types.js";
 import { run } from "./exec.js";
 
-export async function ensureDockerContainer(cfg: DevcontainerConfig): Promise<void> {
+export async function ensureDockerContainer(cfg: DevcontainerConfig, onData?: (data: Buffer) => void): Promise<void> {
 	const name = cfg.containerName;
 	if (!cfg.image) {
 		throw new Error(
@@ -11,7 +11,7 @@ export async function ensureDockerContainer(cfg: DevcontainerConfig): Promise<vo
 	const inspect = await run("docker", ["inspect", "-f", "{{.State.Status}}", name]);
 	if (inspect.code === 0) {
 		if (inspect.stdout.trim() === "running") return;
-		await run("docker", ["start", name]);
+		await run("docker", ["start", name], onData);
 		return;
 	}
 	// Container does not exist - create it, mounting the config root
@@ -26,23 +26,27 @@ export async function ensureDockerContainer(cfg: DevcontainerConfig): Promise<vo
 	// skipped while the container exists, so changing this mount requires
 	// `docker rm` first.
 	const mount = `${cfg.workspaceFolder}:${cfg.workspaceFolder}`;
-	const r = await run("docker", [
-		"run",
-		"-d",
-		"--name",
-		name,
-		"-v",
-		mount,
-		"-w",
-		cfg.projectCwd,
-		// NB: no HOME override. Images whose user is not root (node:*-slim,
-		// python:*-slim, golang:*) would get HOME=/root while running as
-		// uid 1000, breaking every cache/config path with EACCES. The
-		// image's own ENV HOME is the only correct value.
-		cfg.image,
-		"tail",
-		"-f",
-		"/dev/null",
-	]);
+	const r = await run(
+		"docker",
+		[
+			"run",
+			"-d",
+			"--name",
+			name,
+			"-v",
+			mount,
+			"-w",
+			cfg.projectCwd,
+			// NB: no HOME override. Images whose user is not root (node:*-slim,
+			// python:*-slim, golang:*) would get HOME=/root while running as
+			// uid 1000, breaking every cache/config path with EACCES. The
+			// image's own ENV HOME is the only correct value.
+			cfg.image,
+			"tail",
+			"-f",
+			"/dev/null",
+		],
+		onData,
+	);
 	if (r.code !== 0) throw new Error(`docker run failed: ${r.stderr.trim()}`);
 }

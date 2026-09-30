@@ -135,6 +135,15 @@ export class OutputTail {
 		return this.text;
 	}
 
+	/**
+	 * Drop everything retained. Used to hand the view over from the bring-up
+	 * log to the command's own output, so the row does not end up showing two
+	 * unrelated streams at once.
+	 */
+	reset(): void {
+		this.text = "";
+	}
+
 	/** Line and byte counts for the live footer. */
 	counts(): { totalLines: number; totalBytes: number } {
 		let lines = 0;

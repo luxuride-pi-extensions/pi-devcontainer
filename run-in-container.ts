@@ -3,18 +3,143 @@ import { isAbsolute, relative, resolve } from "node:path";
 
 import { ensureDockerContainer } from "./docker.js";
 import { shq } from "./exec.js";
+import { startProgressWidget } from "./progress.js";
+import type { BringUpProgress, WidgetUi } from "./progress.js";
 import type { DevcontainerConfig } from "./types.js";
+
+/** Bring-up output kept for the error a timed-out wait reports. */
+const PROGRESS_REPORT_LINES = 20;
+
+/**
+ * Stands in for a bring-up that has no log yet (a docker-fallback start, or a
+ * second wait after the first cleared it), so the widget needs no null checks
+ * of its own and shows the generic phase rather than nothing.
+ */
+const EMPTY_LOG: BringUpProgress = { append: () => {}, subscribe: () => () => {}, snapshot: () => "" };
+
+export interface SettleOptions {
+	/** Whether the tool is still enabled; a disabled tool is never usable. */
+	isEnabled: () => boolean;
+	/** Called with each line of bring-up output as it arrives. */
+	onProgress?: (line: string) => void;
+	/**
+	 * Seconds to wait before giving up and reporting that bring-up is still
+	 * running. Undefined or <= 0 waits as long as it takes.
+	 */
+	waitBudgetSeconds?: number;
+	/**
+	 * Cancels the WAIT, not the bring-up. The bring-up is a session-wide
+	 * background process, so a cancelled call must leave it running for the
+	 * next one; only the caller's own waiting stops.
+	 */
+	signal?: AbortSignal;
+	/**
+	 * Where to show bring-up progress in the user's status bar, for the
+	 * duration of the wait. Optional: without it the wait is silent apart
+	 * from onProgress, and nothing breaks.
+	 */
+	ui?: WidgetUi;
+}
 
 /**
  * Wait for the background bring-up started at session start, and report
  * failure as an error the tool can surface. A rejected `pendingUp` is the
  * NORMAL failure signal (the bring-up closure already notified the user), so
  * it is swallowed here and re-thrown as a single readable message.
+ *
+ * The wait is BOUNDED. Bring-up on a first run spends its time pulling images
+ * and building feature layers, which can be many minutes; an unbounded await
+ * produces a blank tool row for all of it, and a blank row reads as a hang
+ * rather than as progress. So progress lines are streamed out while waiting,
+ * and a wait that runs past its budget ends with a message naming what is
+ * happening and how to keep waiting — an informed decision instead of a
+ * stuck call.
  */
-export async function settleBringUp(cfg: DevcontainerConfig, isEnabled: () => boolean): Promise<void> {
+export async function settleBringUp(cfg: DevcontainerConfig, opts: SettleOptions): Promise<void> {
 	if (!cfg.pendingUp) return;
-	await cfg.pendingUp.catch(() => undefined);
-	if (!isEnabled()) throw new Error("devcontainer bring-up failed; the container is not available");
+	const log = cfg.bringUpLog;
+	const unsubscribe = log && opts.onProgress ? log.subscribe(opts.onProgress) : undefined;
+	/**
+	 * The waiter's own stream is only as good as the caller's onProgress, so a
+	 * caller that renders nothing (a command, a test) still gets a status bar
+	 * the user can see. Independent subscription, and stopped with the wait.
+	 */
+	const stopWidget = startProgressWidget(opts.ui, log ?? EMPTY_LOG, cfg.projectCwd);
+	// A timer that is never cleared would hold the process open at shutdown.
+	const budget = opts.waitBudgetSeconds !== undefined && opts.waitBudgetSeconds > 0 ? opts.waitBudgetSeconds * 1000 : 0;
+	let timeoutHandle: NodeJS.Timeout | undefined;
+	// The reason bring-up failed is the single most useful thing the waiting
+	// call can report, so it is captured rather than discarded.
+	let upError: string | null = null;
+	try {
+		// Set by the bring-up side only. A timer that fires leaves it false,
+		// which is what distinguishes "still being created" from "done".
+		let upSettled = false;
+		try {
+			await Promise.race([
+				cfg.pendingUp.catch((err: unknown) => {
+					upError = err instanceof Error ? err.message : String(err);
+				}).then(() => {
+					upSettled = true;
+				}),
+				new Promise<void>((resolveTimeout) => {
+					if (budget <= 0) return;
+					timeoutHandle = setTimeout(resolveTimeout, budget);
+				}),
+				// The user's own cancel has to end the wait as surely as the
+				// timeout does: without this a cancel arriving during a
+				// multi-minute pull leaves the call hanging in a void nothing
+				// can be resolved into.
+				new Promise<void>((resolveAbort) => {
+					if (!opts.signal) return;
+					if (opts.signal.aborted) {
+						resolveAbort();
+						return;
+					}
+					opts.signal.addEventListener("abort", () => resolveAbort(), { once: true });
+				}),
+			]);
+		} finally {
+			// Never clear the timeout on the path where it is what resolved the
+			// race, or the pending handle itself keeps the process alive.
+			if (timeoutHandle && upSettled) clearTimeout(timeoutHandle);
+		}
+		if (!upSettled) {
+			if (opts.signal?.aborted) throw new Error("aborted");
+			const report = (log?.snapshot() ?? "")
+				.split("\n")
+				.filter(Boolean)
+				.slice(-PROGRESS_REPORT_LINES);
+			throw new Error(
+				[
+					`the devcontainer is still being created after ${Math.round(budget / 1000)}s — a first-run image pull and feature build, not a failure.`,
+					report.length > 0 ? ["last bring-up output:", ...report.map((l) => `  ${l}`)].join("\n") : "",
+					"Call the command again with a larger `waitForContainer` (e.g. 900) to keep waiting, or watch it yourself on the host with `devcontainer up --workspace-folder <project>`.",
+				]
+					.filter(Boolean)
+					.join("\n"),
+			);
+		}
+	} finally {
+		unsubscribe?.();
+		stopWidget();
+	}
+	if (upError !== null) {
+		const report = (log?.snapshot() ?? "")
+			.split("\n")
+			.filter(Boolean)
+			.slice(-PROGRESS_REPORT_LINES);
+		throw new Error(
+			[
+				`devcontainer bring-up failed: ${upError}`,
+				report.length > 0 ? ["last bring-up output:", ...report.map((l) => `  ${l}`)].join("\n") : "",
+				`The host directory is ${cfg.projectCwd}; fix the config with \`create_devcontainer\` and retry.`,
+			]
+				.filter(Boolean)
+				.join("\n"),
+		);
+	}
+	if (!opts.isEnabled()) throw new Error("devcontainer bring-up failed; the container is not available");
 }
 
 export interface ResolvedCwd {
@@ -181,7 +306,7 @@ export function runInContainer(
 }
 
 /** Await bring-up, then run. Shared by every tool call. */
-export async function ensureReady(cfg: DevcontainerConfig, isEnabled: () => boolean): Promise<void> {
-	await settleBringUp(cfg, isEnabled);
+export async function ensureReady(cfg: DevcontainerConfig, opts: SettleOptions): Promise<void> {
+	await settleBringUp(cfg, opts);
 	if (!cfg.useCli) await ensureDockerContainer(cfg);
 }

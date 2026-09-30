@@ -72,12 +72,20 @@ import { ensureReady, runInContainer } from "./run-in-container.js";
 import { createDevcontainerRenderers, OutputTail, UPDATE_THROTTLE_MS, type DevcontainerDetails } from "./render.js";
 import { collectionsIn, featuresInCollection, loadCatalog, publishedVersions, searchFeatures, type CatalogFeature } from "./features-index.js";
 import { asJsonObject, parseJsonc } from "./jsonc.js";
-import { BASE_IMAGES, detectStack, projectProfile, scaffold } from "./scaffold.js";
+import { BringUpLog, describePhase, startProgressWidget } from "./progress.js";
+import { BASE_IMAGES, describeDockerAccess, detectStack, projectProfile, scaffold } from "./scaffold.js";
 import type { DevcontainerConfig } from "./types.js";
 
 const TOOL_NAME = "devcontainer";
 const CREATE_TOOL_NAME = "create_devcontainer";
 const DEFAULT_TIMEOUT = 120;
+/**
+ * How long one call waits for a still-running bring-up before reporting that
+ * it is still running. Long enough for a warm start, short enough that a cold
+ * image pull comes back as progress plus an offer to keep waiting rather than
+ * as a silent tool row.
+ */
+const DEFAULT_WAIT_FOR_CONTAINER = 90;
 
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag("no-devcontainer", {
@@ -139,6 +147,7 @@ export default function (pi: ExtensionAPI) {
 			"- `stdin` (optional): text piped to the command's standard input. Use it for heredocs and piped input instead of shell redirection to a file.",
 			"- `timeout` (optional): seconds before the command is killed (default 120).",
 			"- `tail` (optional): keep only the LAST N lines of output, for commands whose interesting part is at the end (`npm test`, `cargo build`, a failing build). Omit it to keep the default limit. Use it when the output is mostly noise — you can always re-run with a bigger `tail` or read a log file the command wrote.",
+			"- `waitForContainer` (optional): seconds to wait when the container is still being created by a first-run image pull or feature build (default 90). Pull output is streamed while it waits; on giving up the tool says the build is STILL RUNNING and tells you to call again with a larger value. That is not a failure — retry with a bigger number instead of reporting a broken container."
 		].join("\n"),
 		promptSnippet: "Run a shell command inside this project's devcontainer",
 		promptGuidelines: [
@@ -160,24 +169,35 @@ export default function (pi: ExtensionAPI) {
 						"Keep only the last N lines of output. Use for commands whose interesting output is at the end; omit for the default limit.",
 				}),
 			),
+			waitForContainer: Type.Optional(
+				Type.Number({
+					description:
+						"Seconds to wait for a first-run image pull / feature build before reporting that it is still running (default 90).",
+				}),
+			),
 		}),
 		renderShell: "default",
 		...createDevcontainerRenderers(),
-		async execute(_toolCallId, params, signal, onUpdate, _ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const current = cfg;
 			if (!active || !current) {
 				throw new Error(
 					"this project has no devcontainer; create one with `create_devcontainer`, or run this command with `bash` on the host",
 				);
 			}
-			await ensureReady(current, () => active);
-
-			const timeout = params.timeout === undefined || params.timeout <= 0 ? DEFAULT_TIMEOUT : params.timeout;
-			// Stream the output into the tool row as it arrives, on the same
-			// throttle and tail bound pi's own shell tool uses. The row would
-			// otherwise stay blank for the whole command, leaving a slow build
-			// indistinguishable from a hung one.
+			// The output tail and the row's first update are set up BEFORE the bring-up
+			// wait, because that wait is exactly the stretch where the row would
+			// otherwise stay blank: a first-run image pull spends minutes there and
+			// reads as a hang. The tail is seeded with the bring-up's own output, so
+			// the wait shows pull progress instead of nothing.
 			const tail = new OutputTail();
+			const timeout = params.timeout === undefined || params.timeout <= 0 ? DEFAULT_TIMEOUT : params.timeout;
+			// The emit/schedule pair is declared BEFORE the wait, not after it.
+			// onProgress fires from inside ensureReady, and a const declared
+			// later is in its temporal dead zone until then: a progress line
+			// arriving during bring-up would throw "Cannot access 'schedule'
+			// before initialization" out of the callback, which is how a
+			// still-working bring-up turns into a failed tool call.
 			let pending: ReturnType<typeof setTimeout> | undefined;
 			let lastEmit = 0;
 			let dirty = false;
@@ -189,6 +209,8 @@ export default function (pi: ExtensionAPI) {
 					details: tail.counts(),
 				});
 			};
+			// Streamed on the same throttle and tail bound pi's own shell tool
+			// uses, so a slow command is visibly progressing.
 			const schedule = () => {
 				if (!onUpdate) return;
 				dirty = true;
@@ -206,6 +228,29 @@ export default function (pi: ExtensionAPI) {
 					if (dirty) emit();
 				}, delay);
 			};
+			await ensureReady(current, {
+				isEnabled: () => active,
+				onProgress: (line) => {
+					tail.append(line);
+					schedule();
+				},
+				// The user's own cancel has to stop the wait, not just the
+				// command: a pull that outlives the call would otherwise keep
+				// the row alive with nothing to report.
+				signal,
+				// The status bar is the only channel the user has during the
+				// wait, since the tool row cannot render before the first tick.
+				ui: ctx?.ui,
+				waitBudgetSeconds:
+					params.waitForContainer === undefined || params.waitForContainer <= 0
+						? DEFAULT_WAIT_FOR_CONTAINER
+						: params.waitForContainer,
+			});
+			// The pull/build log leaves the row once the command's own output
+			// starts, so the row shows the command rather than a mixture of two
+			// unrelated streams.
+			tail.reset();
+
 			if (onUpdate) {
 				onUpdate({
 					content: [],
@@ -395,8 +440,13 @@ export default function (pi: ExtensionAPI) {
 			// and a call made in the window reports the error instead of a
 			// container-less exec.
 			const c = cfg;
+			// The log is what the tool row, the status bar and the /devcontainer
+			// command all read, so the pull it prints must be captured here. The
+			// CLI writes its progress to stderr as bare-CR frames.
+			const log = new BringUpLog();
+			c.bringUpLog = log;
 			c.pendingUp = (async () => {
-				const up = await run("devcontainer", upArgs);
+				const up = await run("devcontainer", upArgs, (d) => log.append(d.toString()));
 				if (up.code !== 0) {
 					const detail = up.stderr.trim().split("\n").slice(0, 3).join(" ");
 					throw new Error(detail || `devcontainer up exited ${up.code}`);
@@ -477,8 +527,10 @@ export default function (pi: ExtensionAPI) {
 					"warning",
 				);
 			}
+			const log = new BringUpLog();
+			c.bringUpLog = log;
 			c.pendingUp = (async () => {
-				await ensureDockerContainer(c);
+				await ensureDockerContainer(c, (d) => log.append(d.toString()));
 				if (override.provision && override.provision.length > 0) {
 					await provisionContainer(notify, ["docker", "exec", c.containerName], override.provision);
 				}
@@ -498,11 +550,26 @@ export default function (pi: ExtensionAPI) {
 		// `cfg` points at. A session that never calls the tool would otherwise
 		// surface the rejection unhandled.
 		(cfg.pendingUp as Promise<void>).catch((err: unknown) => {
+			bringUpFinished = true;
+			// The log is included because the reason alone is rarely enough: a
+			// build that dies on a feature reports `exit status 1`, and the
+			// line naming the failing feature is in the output the user cannot
+			// otherwise see.
+			const lines = (cfg?.bringUpLog?.snapshot() ?? "").split("\n").filter(Boolean);
+			const reason = err instanceof Error ? err.message : String(err);
 			notify(
-				`devcontainer unavailable — commands run through the devcontainer tool will fail until this is fixed: ${err instanceof Error ? err.message : String(err)}`,
+				`devcontainer unavailable — commands run through the devcontainer tool will fail until this is fixed: ${reason}\n${
+					lines.length > 0 ? `last bring-up output (${describePhase(lines)}):\n${lines.slice(-12).join("\n")}` : "(no bring-up output was produced)"
+				}`,
 				"error",
 			);
+		// The `.catch` above resolves on failure too, so the flag after it is set
+		// on both outcomes — which is what /devcontainer polls for.
+		}).then(() => {
+			bringUpFinished = true;
 		});
+
+		return cfg.pendingUp;
 	};
 
 	/**
@@ -541,6 +608,7 @@ export default function (pi: ExtensionAPI) {
 			"- `postCreateCommand` (optional): command to run once after the container is created.",
 			"- `forwardPorts` (optional): host ports to forward.",
 			"- `stack` (optional): force the detected stack (affects only the defaults; an explicit `image`/`features` wins).",
+			"- `shareHostDocker` (optional): true (the default on Linux) shares the host's Docker daemon by bind-mounting its socket, which is what a project almost always wants. No feature is added for it. false runs a nested docker-in-docker daemon, which cannot work on a host whose Docker data root is on btrfs. An explicit docker-in-docker feature is always left as you wrote it.",
 			"",
 			"Example: a Node project that also needs Postgres —",
 			"create_devcontainer(image: \"mcr.microsoft.com/devcontainers/typescript-node:22\", features: {\"ghcr.io/devcontainers/features/node:1\": {\"version\": \"22\"}, \"ghcr.io/devcontainers/features/postgres:1\": {\"version\": \"16\"}}, postCreateCommand: \"npm install\", forwardPorts: [5432])",
@@ -571,6 +639,11 @@ export default function (pi: ExtensionAPI) {
 			postCreateCommand: Type.Optional(Type.String({ description: "Command run once after the container is created" })),
 			forwardPorts: Type.Optional(Type.Array(Type.Union([Type.Number(), Type.String()]))),
 			stack: Type.Optional(Type.String({ description: "Force the detected stack instead of using detection" })),
+		shareHostDocker: Type.Optional(
+			Type.Boolean({
+				description: "Share the host's Docker daemon by bind-mounting its socket (default true on Linux/other); no feature is written for it. Set false for a nested docker-in-docker daemon — that one fails on a host whose Docker data root is on btrfs. An explicit docker-in-docker feature in `features` is never rewritten.",
+			}),
+		),
 		}),
 		renderShell: "default",
 		async execute(_toolCallId, params, signal) {
@@ -681,12 +754,18 @@ export default function (pi: ExtensionAPI) {
 			}
 			const detected = detectStack(projectRoot);
 			const effectiveStack = stack ?? detected.id;
+			// dind is never rewritten: a config that nests its daemon is
+			// isolating itself from the host's containers on purpose. It is
+			// only reported, with the btrfs failure mode, so the model can
+			// decide whether the config or the host is what needs changing.
+			const dockerAccess = describeDockerAccess(base);
 			const defaults = scaffold({
 				projectRoot,
 				stack: effectiveStack,
 				features: params.features as Record<string, Record<string, unknown>> | undefined,
 				postCreateCommand: params.postCreateCommand,
 				forwardPorts: params.forwardPorts as (number | string)[] | undefined,
+				shareHostDocker: params.shareHostDocker,
 			});
 			const config: Record<string, unknown> = {
 				...base,
@@ -717,6 +796,10 @@ export default function (pi: ExtensionAPI) {
 							`stack: ${effectiveStack}${stack ? " (forced)" : existingPath ? " (detected; existing config preserved)" : " (detected)"}`,
 							`image: ${String(config.image)}`,
 							`features: ${Object.keys((config.features as Record<string, unknown>) ?? {}).join(", ") || "(none)"}`,
+							// A silent repair would leave the model explaining a
+							// config change it never made, so the finding is stated
+							// in the result.
+							...(dockerAccess.mode === "dind" ? [`docker: ${dockerAccess.note}`] : []),
 							"",
 							JSON.stringify(config, null, 2),
 						].join("\n"),
@@ -729,6 +812,59 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool(devcontainerTool);
 	pi.registerTool(configTool);
+
+	// The bring-up log, for the slash command. Kept in the same module scope
+	// as `cfg` so the command shows the SAME lines the tool row does rather
+	// than starting a second `up` that would race the first.
+	//
+	// `cfg.pendingUp` is never cleared, so it cannot say whether the bring-up
+	// is still running; a session flag set from the same handlers that report
+	// the outcome is the honest signal, and polling the promise itself would
+	// spin for the life of the session.
+	let bringUpFinished = false;
+	const liveLog = (): BringUpLog => cfg?.bringUpLog ?? new BringUpLog();
+	const watchUi = (ui: ExtensionUIContext | null | undefined): void => {
+		const log = cfg?.bringUpLog;
+		const lines = log ? log.snapshot().split("\n").filter(Boolean) : [];
+		if (!cfg) {
+			ui?.notify?.("no devcontainer is being built for this project", "warning");
+			return;
+		}
+		if (lines.length === 0) {
+			// A one-shot status would be a lie here: nothing has printed yet, so
+			// the widget is what the user watches until output arrives.
+			ui?.setStatus?.("devcontainer", "⏳ devcontainer — waiting for the first output…");
+			const stop = startProgressWidget(ui ?? undefined, liveLog(), cfg.projectCwd);
+			setTimeout(stop, 1500);
+			return;
+		}
+		// The phase is the part the user cannot read off a raw log line, so
+		// it is stated first; the tail of the log is what they asked for.
+		ui?.notify?.(`devcontainer: ${describePhase(lines)} — ${cfg.projectCwd}\n${lines.slice(-12).join("\n")}`, "info");
+	};
+
+	pi.registerCommand("devcontainer", {
+		description: "show what the devcontainer bring-up is doing right now",
+		handler: async (_args, cmdCtx) => {
+			const ui = cmdCtx?.ui ?? lastUi;
+			if (ui?.setStatus) {
+				// A long poll rather than a one-shot: the user asked to WATCH,
+				// and the log is produced by a background process that may not
+				// have printed yet.
+				ui.setStatus("devcontainer", "⏳ devcontainer — watching bring-up, press esc to stop");
+				const stop = startProgressWidget(ui, liveLog(), cfg?.projectCwd ?? "this project");
+				const timer = setInterval(() => {
+					if (!bringUpFinished) return;
+					clearInterval(timer);
+					stop();
+					ui.notify?.("devcontainer bring-up finished", "info");
+				}, 1000);
+				timer.unref?.();
+			} else {
+				watchUi(ui);
+			}
+		},
+	});
 
 	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 		lastUi = ctx.ui;

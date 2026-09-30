@@ -21,8 +21,10 @@ import { asJsonObject, parseJsonc } from "./jsonc.js";
 import { alreadyInContainer, loadDevcontainerJson } from "./config.js";
 import { provisionContainer } from "./provision.js";
 import { resolveToolCwd, runInContainer, settleBringUp } from "./run-in-container.js";
+import { BringUpLog, describePhase, startProgressWidget } from "./progress.js";
 import { shq } from "./exec.js";
-import { BASE_IMAGE, BASE_IMAGES, DOTNET_FEATURE, NODE_FEATURE, STACK_FEATURES, baseImageFor, featureFor, projectProfile, scaffold, stackIds } from "./scaffold.js";
+import { DOCKER_IN_DOCKER_FEATURE, DOCKER_OUTSIDE_OF_DOCKER_FEATURE, BASE_IMAGE, BASE_IMAGES, DOTNET_FEATURE, NODE_FEATURE, STACK_FEATURES, baseImageFor, describeDockerAccess, featureFor, projectProfile, scaffold, stackIds } from "./scaffold.js";
+import type { Scaffold } from "./scaffold.js";
 import { collectionsIn, featuresInCollection, loadCatalog, parseFeaturesPage, parseRef, publishedVersions, searchFeatures } from "./features-index.js";
 import { MAX_DISPLAY_BYTES_FOR_TEST, OutputTail } from "./render.js";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
@@ -277,24 +279,128 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	const cfg = { pendingUp: undefined } as unknown as DevcontainerConfig;
 
 	// No bring-up in flight: resolves immediately, in both states.
-	await settleBringUp(cfg, () => true);
-	await settleBringUp(cfg, () => false);
+	await settleBringUp(cfg, { isEnabled: () => true });
+	await settleBringUp(cfg, { isEnabled: () => false });
 	checkTrue("settleBringUp with no pendingUp resolves", true);
 
 	cfg.pendingUp = Promise.resolve();
-	await settleBringUp(cfg, () => true);
+	await settleBringUp(cfg, { isEnabled: () => true });
 	checkTrue("settleBringUp resolves when up succeeded and proxy enabled", true);
 
-	// Bring-up rejected: the promise is swallowed and the failure is reported
-	// by the throw, because `pendingUp` rejecting is the NORMAL signal.
+	// Bring-up rejected: the reason is reported, not swallowed, because the
+	// model otherwise sees a bare "bring-up failed" and cannot act on it.
 	cfg.pendingUp = Promise.reject(new Error("up exited 1"));
 	let msg = "";
 	try {
-		await settleBringUp(cfg, () => false);
+		await settleBringUp(cfg, { isEnabled: () => true });
 	} catch (err) {
 		msg = err instanceof Error ? err.message : String(err);
 	}
-	check("settleBringUp throws on rejected up", msg, "devcontainer bring-up failed; the container is not available");
+	checkTrue("settleBringUp reports the bring-up reason", msg.includes("up exited 1"), msg);
+}
+
+// --- a still-running bring-up is bounded, streamed, and re-waitable ----
+// The blank-row hang this fixes: an unbounded await over a multi-minute image
+// pull. The wait must return, must have shown the pull output while waiting,
+// and must not claim the container is ready.
+{
+	const log = new BringUpLog();
+	log.append("Pulling mcr.microsoft.com/devcontainers/dotnet:8.0\n");
+	log.append("abc123: Download complete\n");
+	let never = false;
+	const cfg = {
+		// Pending on purpose: resolves only if someone outside this test does.
+		pendingUp: new Promise<void>(() => {}),
+		bringUpLog: log,
+		projectCwd: "/proj",
+	} as unknown as DevcontainerConfig;
+
+	const seen: string[] = [];
+	let msg = "";
+	const started = Date.now();
+	try {
+		await settleBringUp(cfg, { isEnabled: () => true, onProgress: (l) => seen.push(l), waitBudgetSeconds: 0.3 });
+		never = true;
+	} catch (err) {
+		msg = err instanceof Error ? err.message : String(err);
+	}
+	checkTrue("a pending bring-up does not hang the call", !never);
+	checkTrue("the wait is bounded by its budget", Date.now() - started < 5000, Date.now() - started);
+	checkTrue("the report says it is still running, not failed", msg.includes("still being created"), msg);
+	checkTrue("the report is not a failure verdict", !msg.includes("bring-up failed"), msg);
+	checkTrue("the report says how to keep waiting", msg.includes("waitForContainer"), msg);
+	// The streamed lines include what the log already held, so a caller that
+	// subscribes late still sees the pull that happened before it started.
+	check("progress already in the log is replayed", seen, [
+		"Pulling mcr.microsoft.com/devcontainers/dotnet:8.0\n",
+		"abc123: Download complete\n",
+	]);
+	checkTrue("the report carries the pull output", msg.includes("abc123: Download complete"), msg);
+
+	// A line arriving after the give-up is still logged, and a later call
+	// with a bigger budget keeps waiting rather than starting over.
+	log.append("def456: Extracting\n");
+	const seen2: string[] = [];
+	let stillPending = false;
+	const cfg2 = {
+		pendingUp: new Promise<void>((res) => setTimeout(res, 200)),
+		bringUpLog: log,
+		projectCwd: "/proj",
+	} as unknown as DevcontainerConfig;
+	await settleBringUp(cfg2, { isEnabled: () => true, onProgress: (l) => seen2.push(l), waitBudgetSeconds: 10 }).then(
+		() => (stillPending = false),
+		() => (stillPending = true),
+	);
+	checkTrue("a later call with a bigger budget completes", !stillPending);
+	checkTrue("the later call saw the earlier output plus its own", seen2.length >= 3, seen2.length);
+}
+
+// --- bring-up progress log --------------------------------------------
+// A pull's progress frames arrive as CR-terminated text, and a frame that
+// arrives without a newline must not be held back forever.
+{
+	const log = new BringUpLog();
+	const seen: string[] = [];
+	log.subscribe((l) => seen.push(l));
+	// Mid-line chunk: the first half must not surface until the line closes.
+	log.append("half a ");
+	check("a partial line is not emitted yet", seen, []);
+	log.append("line\n");
+	check("the completed line is emitted", seen, ["half a line\n"]);
+
+	// Docker's pull progress uses bare CRs.
+	log.append("one\rtwo\r");
+	check("CR frames are separate lines", seen.slice(1), ["one\n", "two\n"]);
+
+	// Blank padding between frames would crowd out real progress.
+	log.append("\n\n");
+	log.append("kept\n");
+	checkTrue("blank lines are dropped", !seen.includes("\n"));
+
+	// A last frame with no trailing newline is still reported by snapshot,
+	// which is what the give-up message reads.
+	log.append("tail without newline");
+	check("snapshot includes the unterminated tail", log.snapshot().endsWith("tail without newline"), true);
+
+	// Retention is bounded: a long pull must not grow the TUI without limit.
+	for (let i = 0; i < 1000; i++) log.append(`frame ${i}\n`);
+	checkTrue("retained lines are bounded", log.snapshot().split("\n").length <= 200, log.snapshot().split("\n").length);
+	checkTrue("the newest line survives the bound", log.snapshot().includes("frame 999"));
+	checkTrue("the oldest line is dropped", !log.snapshot().includes("frame 1\n"));
+}
+
+// --- the display tail can be handed over ------------------------------
+// The row shows pull progress during bring-up and then the command's own
+// output, so the tail has to be able to start over without being replaced.
+{
+	const tail = new OutputTail();
+	tail.append("pull progress\n");
+	check("the tail holds what was appended", tail.value(), "pull progress\n");
+	tail.reset();
+	check("reset empties the tail", tail.value(), "");
+	check("reset zeroes the counts", tail.counts(), { totalLines: 0, totalBytes: 0 });
+	tail.append("command output\n");
+	check("the tail accepts new output after a reset", tail.value(), "command output\n");
 }
 
 // --- provisioning marker keys on features too -------------------------
@@ -387,10 +493,20 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		// project that is both Rust and Node is a Rust project.
 		check("rust beats node", scaffold({ projectRoot: proj }).stack, "rust");
 		check(
+			// A Rust project is scaffolded with the host Docker socket shared
+			// by default, so the expected config carries the mount.
 			"rust config",
 			JSON.parse(scaffold({ projectRoot: proj }).text),
-			{ name: "Rust", image: "mcr.microsoft.com/devcontainers/rust:1", features: { "ghcr.io/devcontainers/features/rust:1": {} } },
+			{
+				name: "Rust",
+				image: "mcr.microsoft.com/devcontainers/rust:1",
+				features: {
+					"ghcr.io/devcontainers/features/rust:1": {},
+				},
+				mounts: [{ source: "/var/run/docker.sock", target: "/var/run/docker.sock", type: "bind" }],
+			},
 		);
+		checkTrue("the default scaffold shares the host docker socket", scaffold({ projectRoot: proj }).config.mounts !== undefined);
 
 		// A .NET project is usually a bare *.csproj with no global.json, so
 		// detection needs a directory scan; the file lives in a subdirectory,
@@ -428,6 +544,7 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 				"ghcr.io/devcontainers/features/python:1": {},
 				"ghcr.io/devcontainers/features/postgres:1": { version: "16" },
 			},
+			mounts: [{ source: "/var/run/docker.sock", target: "/var/run/docker.sock", type: "bind" }],
 			postCreateCommand: "pip install -e .",
 			forwardPorts: ["8000", "5432:5432"],
 		});
@@ -516,7 +633,11 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	}
 
 	// cpp has no feature at all, so its stack must not name one.
-	check("cpp stack declares no feature", scaffold({ projectRoot: mkdtempSync(join(tmpdir(), "cpp-")), stack: "cpp" }).features, []);
+	check(
+		"cpp stack declares no feature",
+		scaffold({ projectRoot: mkdtempSync(join(tmpdir(), "cpp-")), stack: "cpp", shareHostDocker: false }).features,
+		[],
+	);
 
 	// Every stack the tool offers must produce a base image; the empty-string
 	// case is what a forgotten switch arm would look like.
@@ -623,6 +744,212 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	checkTrue("the tail stays bounded", big.value().length <= MAX_DISPLAY_BYTES_FOR_TEST, big.value().length);
 	check("the retained lines are whole", big.value().split("\n").filter(Boolean).every((l) => l.length === 99), true);
 	check("line count agrees with the retained text", big.counts().totalLines, big.value().split("\n").filter(Boolean).length + 1);
+}
+
+
+// --- the phase a user is shown ----------------------------------------
+// A status bar that says "working" for four minutes tells the user nothing;
+// the phase is what distinguishes a healthy pull from a stuck one.
+{
+	check("an empty log names the whole job", describePhase([]), "pulling and building the devcontainer image");
+	check("a pull in progress is a download", describePhase(["abc123: Downloading 41.2 MB/120 MB"]), "downloading image layers");
+	check("a pull in progress can also be a layer fetch", describePhase(["Pulling fs layer 1a2b3c"]), "downloading image layers");
+	check("a finished download is not a finished pull", describePhase(["abc123: Download complete"]), "downloading image layers");
+	check("download done and extracting is the extract phase", describePhase(["abc123: Download complete", "abc123: Extracting 88.4 MB/88.4 MB"]), "extracting downloaded layers");
+	check("extracting alone is the extract phase", describePhase(["abc123: Extracting 10 MB/88 MB"]), "extracting image layers");
+	// Order matters: a log holds several of these at once, and the most
+	// specific one is the one that is actually happening.
+	check("a complete pull outranks a stale download line", describePhase(["abc123: Downloading 1 MB/2 MB", "Pull complete"]), "image pulled");
+	check("extracting outranks an earlier completed download", describePhase(["abc123: Download complete", "abc123: Extracting 88.4 MB/88.4 MB"]), "extracting downloaded layers");
+	check("a fresh image is a finished pull", describePhase(["Status: Downloaded newer image for mcr.microsoft.com/devcontainers/dotnet:8.0"]), "image pulled");
+	check("naming to means the image is being built", describePhase(["#8 naming to docker.io/library/pi-devcontainer"]), "building image from the devcontainer config");
+	check("buildkit means the image is being built", describePhase(["#7 [2/3] RUN /bin/sh -c apt-get update"]), "building image from the devcontainer config");
+	check("a feature is being installed", describePhase(["[Features] Installing feature ghcr.io/devcontainers/features/docker-in-docker:4"]), "installing devcontainer features");
+	check("a created container is reported", describePhase(["[2/3] Creating container"]), "creating the container");
+	check("a started container is reported", describePhase(["[3/4] Starting container"]), "container starting");
+	check("a completed run is the last step", describePhase(["[3/4] Starting container", "Completed"]), "container starting");
+	// buildx prints "Running" for an ordinary build step, and a feature's apt
+	// run must not read as a container that has finished starting.
+	check("a build step is not a started container", describePhase(["#17 0.329 Running apt-get update..."]), "building image from the devcontainer config");
+	// Most-specific-first must survive a log that already advanced.
+	// The buildx pull a feature build does, which is the slow part of a real
+	// first run: byte counters, and `done` on the lines that have finished.
+	check("a live buildx byte counter is a download", describePhase(["#4 sha256:ab 12.3MB / 221.26MB 41.2s"]), "downloading image layers");
+	check("a finished buildx byte counter is not a live download", describePhase(["#4 sha256:ab 221.26MB / 221.26MB 1216.8s done"]), "pulling and building the devcontainer image");
+	check("a live counter outranks a finished one", describePhase(["#4 sha256:ab 221.26MB / 221.26MB 1216.8s done", "#4 sha256:cd 1.0MB / 43.51MB 2.0s"]), "downloading image layers");
+	// A later step is not masked by an earlier one: describePhase(["abc123: Extracting 1 MB/2 MB", "Pull complete", "naming to x", "[Features] installing"]), "installing devcontainer features");
+	// Same test one stage earlier: the build line must not win over the
+	// feature install that follows it.
+	check("a build is not masked by a later container step", describePhase(["naming to x", "[2/3] Creating container"]), "creating the container");
+}
+
+// --- the status bar during bring-up -----------------------------------
+// The user asked to see the pull. The tool row cannot render it (the wait
+// happens before the first output), so the status bar is the channel.
+{
+	const log = new BringUpLog();
+	const statuses: (string | undefined)[] = [];
+	const working: (string | undefined)[] = [];
+	const stop = startProgressWidget(
+		{ setStatus: (_k, t) => statuses.push(t), setWorkingMessage: (m) => working.push(m) },
+		log,
+		"/proj",
+	);
+	// Immediately, not only on the timer: the first tick is what the user
+	// sees during a wait that ends in a couple of seconds.
+	checkTrue("the status is set before the first tick elapses", statuses.length === 1, statuses.length);
+	checkTrue("the status names the project", statuses[0]?.includes("/proj") === true, statuses[0]);
+	checkTrue("the status shows elapsed seconds", /⏳ devcontainer \d+s — /.test(statuses[0] ?? "") === true, statuses[0]);
+	checkTrue("the working message names the project", working[0]?.includes("/proj") === true, working[0]);
+
+	// The newest moving line is shown, because a changing percentage is the
+	// clearest evidence the pull is alive.
+	log.append("abc123: Downloading 41.2 MB/120 MB\n");
+	log.append("abc123: Downloading 62.0 MB/120 MB\n");
+	stop();
+	// The final tick happened synchronously inside stop's clearInterval, so
+	// drive one directly: append then re-run a widget and read the first tick.
+	const seen: (string | undefined)[] = [];
+	const stop2 = startProgressWidget({ setStatus: (_k, t) => seen.push(t) }, log, "/proj");
+	stop2();
+	checkTrue("the moving progress line is shown, not just the phase", seen[0]?.includes("Downloading 62.0 MB/120 MB") === true, seen[0]);
+	// The buildx form is the one a real feature build produces.
+	const seenBytes: (string | undefined)[] = [];
+	const logBytes = new BringUpLog();
+	logBytes.append("#4 sha256:cd 1.0MB / 43.51MB 2.0s\n");
+	const stop3 = startProgressWidget({ setStatus: (_k, t) => seenBytes.push(t) }, logBytes, "/proj");
+	stop3();
+	checkTrue("a buildx byte counter is shown as the detail", seenBytes[0]?.includes("1.0MB / 43.51MB") === true, seenBytes[0]);
+
+	// The stop has to clear the row, or it lingers after the work is done and
+	// claims something is still running.
+	checkTrue("stopping clears the status", statuses[statuses.length - 1] === undefined, statuses[statuses.length - 1]);
+	checkTrue("stopping clears the working message", working[working.length - 1] === undefined, working[working.length - 1]);
+
+	// A mode with no status bar must not throw: the widget is started on
+	// every call, including the ones pi makes outside the TUI.
+	let survived = true;
+	try {
+		startProgressWidget(undefined, log, "/proj")();
+		startProgressWidget({}, log, "/proj")();
+	} catch {
+		survived = false;
+	}
+	checkTrue("a UI without a status bar is tolerated", survived);
+}
+
+// --- a watcher can tell a finished bring-up from a live one ------------
+// `pendingUp` is never cleared, so a watcher that polled it would report
+// "still building" for the rest of the session.
+{
+	// The signal the slash command polls: set on BOTH outcomes, because the
+	// failure notification is also followed by a catch that resolves.
+	const p = Promise.reject(new Error("feature install failed")).catch(() => {});
+	let finished = false;
+	p.then(() => {
+		finished = true;
+	});
+	await p;
+	await new Promise((r) => setTimeout(r, 20));
+	checkTrue("a failed bring-up also ends the watch", finished);
+}
+
+// --- cancelling a wait actually ends it --------------------------------
+// A pull that outlives the call is a session-wide process; the caller's
+// patience is not, and esc has to work during the wait.
+{
+	const log = new BringUpLog();
+	const ac = new AbortController();
+	const cfg = {
+		pendingUp: new Promise<void>(() => {}),
+		bringUpLog: log,
+		projectCwd: "/proj",
+	} as unknown as DevcontainerConfig;
+	let msg = "";
+	let returned = false;
+	const started = Date.now();
+	setTimeout(() => ac.abort(), 100);
+	try {
+		await settleBringUp(cfg, { isEnabled: () => true, signal: ac.signal });
+	} catch (err) {
+		msg = String((err as Error)?.message ?? err);
+	}
+	returned = true;
+	checkTrue("an abort ends the wait", returned && Date.now() - started < 5000, Date.now() - started);
+	// A cancel is not a bring-up failure: the background process is still
+	// running, and the message must not claim otherwise.
+	checkTrue("an abort is not reported as a failure", !msg.includes("bring-up failed"), msg);
+	checkTrue("an abort is not reported as still creating", !msg.includes("still being created"), msg);
+}
+
+// --- a progress callback cannot run before its own bindings -----------
+// Regression: `onProgress` fires from INSIDE ensureReady, and the emit/schedule
+// pair it calls was declared after the wait. The `const schedule` was still in
+// its temporal dead zone, so the first pull line of a real bring-up threw
+// "Cannot access 'schedule' before initialization" out of the callback and
+// turned a working build into a failed tool call. Nothing type-checks this:
+// the reference is legal TypeScript, it is just uninitialised at call time.
+{
+	// Compiled to .smoke-build/, so the source sits one directory up.
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	// The run tool's execute body, from its signature to the end of the wait.
+	const execute = source.slice(source.indexOf("async execute(_toolCallId, params, signal, onUpdate, ctx)"));
+	const wait = execute.indexOf("await ensureReady(");
+	checkTrue("the run tool's wait was found", wait > 0, wait);
+	const scheduleDecl = execute.indexOf("const schedule =");
+	const emitDecl = execute.indexOf("const emit =");
+	checkTrue("the emit callback is declared before the wait", emitDecl !== -1 && emitDecl < wait, emitDecl);
+	checkTrue("the schedule callback is declared before the wait", scheduleDecl !== -1 && scheduleDecl < wait, scheduleDecl);
+	// Ordering alone is not enough: a `let pending` the throttling timer uses
+	// must exist before the first onProgress can schedule a tick through it.
+	const pendingDecl = execute.indexOf("let pending");
+	checkTrue("the throttle timer handle is declared before the wait", pendingDecl !== -1 && pendingDecl < wait, pendingDecl);
+}
+
+// --- docker access: share the host daemon by default, never nest -------
+// A nested daemon keeps its metadata on whatever filesystem the HOST keeps
+// /var/lib/docker on, and on btrfs it stalls on volumes/metadata.db forever:
+// the container starts and every `docker` call inside it times out. So a
+// scaffolded config shares the host socket — but an EXPLICIT dind feature is
+// left exactly as asked, because nesting is how a project keeps the host's
+// containers and images out of reach, and rewriting it would undo that.
+{
+	const dind: Scaffold = scaffold({ projectRoot: "/proj", stack: "none", features: { [DOCKER_IN_DOCKER_FEATURE]: { version: "latest" } } });
+	checkTrue("an explicit dind feature is left alone", Object.keys((dind.config.features as Record<string, unknown>) ?? {}).includes(DOCKER_IN_DOCKER_FEATURE) === true);
+	checkTrue("an explicit dind gets no host socket mount", dind.config.mounts === undefined);
+	checkTrue("an explicit dind is not joined by the socket feature", Object.keys((dind.config.features as Record<string, unknown>) ?? {}).includes(DOCKER_OUTSIDE_OF_DOCKER_FEATURE) === false);
+
+	const shared: Scaffold = scaffold({ projectRoot: "/proj", stack: "none" });
+	checkTrue("a default config mounts the host socket", (shared.config.mounts as { target: string }[])?.[0]?.target === "/var/run/docker.sock");
+	// The bind mount IS the sharing: the feature would install a CLI and env
+	// vars for the same socket, and cannot coexist with a hand-mounted one.
+	checkTrue("a default config does not name the socket feature", Object.keys((shared.config.features as Record<string, unknown>) ?? {}).includes(DOCKER_OUTSIDE_OF_DOCKER_FEATURE) === false);
+
+	const optedOut: Scaffold = scaffold({ projectRoot: "/proj", stack: "none", shareHostDocker: false });
+	checkTrue("shareHostDocker false adds no socket feature", Object.keys((optedOut.config.features as Record<string, unknown>) ?? {}).includes(DOCKER_OUTSIDE_OF_DOCKER_FEATURE) === false);
+	checkTrue("shareHostDocker false mounts no socket", optedOut.config.mounts === undefined);
+
+	// Reading a config's Docker access changes nothing, and says why a nested
+	// daemon can be unusable — the fix belongs on the host, not in the config.
+	const nested: Record<string, unknown> = {
+		image: "mcr.microsoft.com/devcontainers/dotnet:8.0",
+		features: { [DOCKER_IN_DOCKER_FEATURE]: { version: "latest" } },
+		forwardPorts: [8080],
+	};
+	const before = JSON.stringify(nested);
+	const reported = describeDockerAccess(nested);
+	check("a dind config is reported as dind", reported.mode, "dind");
+	checkTrue("the dind report names the btrfs failure mode", reported.note.includes("btrfs"), reported.note);
+	checkTrue("the dind report says the host is not reachable", reported.note.includes("NOT visible"), reported.note);
+	check("inspecting a config does not change it", JSON.stringify(nested), before);
+	checkTrue("a dind config is not given a host socket", nested.mounts === undefined);
+	checkTrue("a dind config keeps its features", Object.keys((nested.features as Record<string, unknown>)[DOCKER_IN_DOCKER_FEATURE] !== undefined ? (nested.features as Record<string, unknown>) : {}).length === 1);
+
+	// The other two modes are told apart, so the result never claims a shared
+	// daemon the config does not actually mount.
+	check("a socket config is reported as a host socket", describeDockerAccess({ features: { [DOCKER_OUTSIDE_OF_DOCKER_FEATURE]: {} } }).mode, "host-socket");
+	check("a config with no docker feature reports none", describeDockerAccess({ image: "x" }).mode, "none");
+	check("a dind feature at another major is still recognized", describeDockerAccess({ features: { "ghcr.io/devcontainers/features/docker-in-docker:2": {} } }).mode, "dind");
 }
 
 console.log(failures === 0 ? `\nALL ${checks} CHECKS PASSED` : `\n${failures}/${checks} CHECKS FAILED`);

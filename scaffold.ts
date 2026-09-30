@@ -101,8 +101,24 @@ export interface ScaffoldOptions {
 	name?: string;
 	/** Shell commands to run once, after the container is created. */
 	postCreateCommand?: string;
-	/** Host ports to forward, e.g. `[3000]` or `["3000:3000"]`. */
+	/** Host ports to forward, e.g. `[3000]` or `["3000:8080"]`. */
 	forwardPorts?: (number | string)[];
+	/**
+	 * Share the host's Docker daemon instead of running a nested one.
+	 *
+	 * True by default on a Linux host, where sharing is both the common setup
+	 * and the one that works. A nested daemon keeps its graphdriver and volume
+	 * metadata on whatever filesystem the HOST Docker keeps `/var/lib/docker`
+	 * on, and where that is btrfs the nested daemon stalls indefinitely opening
+	 * `/var/lib/docker/volumes/metadata.db` — the container starts and every
+	 * `docker` call inside it times out. Set this to false only for a project
+	 * that must build and run its own images.
+	 *
+	 * Sharing is done with a bind mount of the host socket alone, not with the
+	 * docker-outside-of-docker feature: the mount is what the daemon connection
+	 * actually is, and the feature only adds a CLI and env vars on top of it.
+	 */
+	shareHostDocker?: boolean;
 }
 
 export interface Scaffold {
@@ -278,11 +294,26 @@ export function scaffold(options: ScaffoldOptions): Scaffold {
 		features[id] = { ...(features[id] ?? {}), ...opts };
 	}
 
+	// Docker access: share the host daemon unless the caller asked otherwise.
+	// A dind feature the caller supplied is left alone — they asked for a
+	// nested daemon on purpose.
+	const shareDocker = options.shareHostDocker ?? process.platform !== "win32";
+	const dindRequested = Object.keys(features).some((id) => id.includes("docker-in-docker"));
+	const socketShared = shareDocker && !dindRequested;
+
 	const config: Record<string, unknown> = {
 		name: options.name ?? stack.label,
 		image: options.image ?? baseImageFor(stack.id),
 	};
 	if (Object.keys(features).length > 0) config.features = features;
+	// The bind mount alone gives the container the host's daemon. The
+	// docker-outside-of-docker feature would install a CLI and a few env vars
+	// for the same effect, and it cannot work together with a socket mounted
+	// by hand anyway, so the mount is the whole of it.
+	if (socketShared) {
+		const { source, target } = dockerSocketMount();
+		config.mounts = [{ source, target, type: "bind" }];
+	}
 	if (options.postCreateCommand) config.postCreateCommand = options.postCreateCommand;
 	if (options.forwardPorts && options.forwardPorts.length > 0) {
 		config.forwardPorts = options.forwardPorts.map((p) => (typeof p === "number" ? String(p) : p));
@@ -295,6 +326,67 @@ export function scaffold(options: ScaffoldOptions): Scaffold {
 /** Stack ids offered in the tool description, for error messages. */
 export function stackIds(): string[] {
 	return [...STACKS.map((s) => s.id), STACK_NONE.id];
+}
+
+/** The dind feature, which runs a nested Docker daemon inside the container. */
+export const DOCKER_IN_DOCKER_FEATURE = "ghcr.io/devcontainers/features/docker-in-docker:4";
+/**
+ * The host-socket feature. NOT written by the scaffold any more: a bind mount
+ * of the socket already shares the daemon, and the feature adds a CLI and env
+ * vars on top. Still named here so a config that declares it is recognised as
+ * host-socket Docker access rather than something unrecognised.
+ */
+export const DOCKER_OUTSIDE_OF_DOCKER_FEATURE = "ghcr.io/devcontainers/features/docker-outside-of-docker:1";
+
+/**
+ * The socket a sharing config mounts. Only Windows differs: the host socket
+ * there lives inside the VM at a different name. A macOS host and a Linux one
+ * both serve /var/run/docker.sock.
+ */
+export function dockerSocketMount(): { source: string; target: string } {
+	if (process.platform === "win32") return { source: "//var/run/docker.sock", target: "//var/run/docker.sock" };
+	return { source: "/var/run/docker.sock", target: "/var/run/docker.sock" };
+}
+
+/**
+ * Inspect a config's Docker access, without changing it.
+ *
+ * dind is a deliberate choice and is NEVER rewritten: a project that nests
+ * its daemon wants the host's containers, images and networks out of reach,
+ * and quietly swapping in a host-socket mount would break that isolation in
+ * the one way the author did not choose. So this only reports what the config
+ * asks for, plus the reason a nested daemon can be present and unusable, so
+ * the model can decide rather than be corrected.
+ *
+ * Returns the reason text for the tool result; `config` is only read.
+ */
+export function describeDockerAccess(
+	config: Record<string, unknown>,
+): { mode: "dind" | "host-socket" | "none"; note: string } {
+	const features = asRecord(config.features);
+	const dind = Object.keys(features).find(
+		(id) => id === DOCKER_IN_DOCKER_FEATURE || id.startsWith("ghcr.io/devcontainers/features/docker-in-docker:"),
+	);
+	if (dind) {
+		return {
+			mode: "dind",
+			note:
+				"the config nests its own Docker daemon (docker-in-docker), so the host's containers and images are deliberately NOT visible. A nested daemon keeps its data on whatever filesystem the host keeps /var/lib/docker on; on a btrfs data root its `docker` calls hang on /var/lib/docker/volumes/metadata.db. If that is the symptom, the fix is the host's Docker data root, not this config.",
+		};
+	}
+	const shared =
+		Object.keys(features).some((id) => id.includes("docker-outside-of-docker")) ||
+		asArray(config.mounts).some((m) => typeof m === "object" && m !== null && String((m as { target?: unknown }).target).endsWith("docker.sock"));
+	if (shared) return { mode: "host-socket", note: "the config shares the host's Docker daemon through a bind-mounted socket." };
+	return { mode: "none", note: "the config gives the container no Docker access." };
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function asArray(value: unknown): unknown[] {
+	return Array.isArray(value) ? value : [];
 }
 
 export interface ProjectProfile {

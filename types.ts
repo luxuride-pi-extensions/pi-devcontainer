@@ -1,3 +1,5 @@
+import type { BringUpLog } from "./progress.js";
+
 export interface DevcontainerConfig {
 	projectCwd: string;
 	/** canonical (symlink-resolved) project path — what the kernel sees */
@@ -25,4 +27,10 @@ export interface DevcontainerConfig {
 	 * session start; the first command awaits it before running.
 	 */
 	pendingUp?: Promise<void>;
+	/**
+	 * Bring-up's own output, retained so a waiting tool call can show it as it
+	 * arrives and a failed or timed-out call can report what actually
+	 * happened instead of a bare exit code.
+	 */
+	bringUpLog?: BringUpLog;
 }
