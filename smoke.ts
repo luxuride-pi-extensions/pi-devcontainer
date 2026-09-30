@@ -914,6 +914,27 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	}
 }
 
+// --- bringUp must not hand its caller the bring-up promise -----------
+// Regression: `return cfg.pendingUp` at the end of an async function makes
+// the CALLER's await wait for the whole bring-up. session_start awaits
+// bringUp, so that put the length of a first-run image pull in front of
+// pi's startup and the session appeared frozen before the first prompt.
+{
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	const bringUp = source.slice(source.indexOf("const bringUp = async"), source.indexOf("const rebuildTool"));
+	// Matched per line so the comment explaining the fix does not trip it.
+	const returnsPending = bringUp.split("\n").some((l) => /^\s*return\s+cfg\.pendingUp/.test(l));
+	checkTrue("bringUp does not return the pending promise", !returnsPending, "return cfg.pendingUp");
+	// The promise must still be handled, or a failure is an unhandled rejection.
+	checkTrue("the pending promise is still caught", bringUp.includes(".catch("), "catch");
+	// The doc comment already promises this; the promise is the reason.
+	checkTrue(
+		"the declaration says bring-up returns immediately",
+		/Bring-up itself stays in the BACKGROUND[\s\S]{0,200}awaiting cfg\.pendingUp/.test(source),
+		"doc comment",
+	);
+}
+
 // --- devcontainer_rebuild: a rebuild is bring-up with an argument -----
 // The tool exists because a config edit does not always reach the container on
 // its own, and the fix has to be a re-run of `up` rather than a second,

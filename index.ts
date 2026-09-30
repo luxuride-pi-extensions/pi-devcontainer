@@ -587,7 +587,15 @@ export default function (pi: ExtensionAPI) {
 			bringUpInFlight = false;
 		});
 
-		return cfg.pendingUp;
+		// NOT `return cfg.pendingUp`. `bringUp` is async, so returning the
+		// promise makes the CALLER's `await bringUp(...)` wait for the whole
+		// bring-up — and the two callers are `session_start` (which would hold
+		// pi's startup for the length of a first-run pull) and the create tool.
+		// Bring-up is deliberately fire-and-forget here; the run and rebuild
+		// tools are what await cfg.pendingUp, through settleBringUp's bounded
+		// wait. The comment on the declaration says "returns immediately", and
+		// that promise is the whole reason the tools carry a wait budget.
+		void cfg.pendingUp;
 	};
 
 	/**
