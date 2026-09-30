@@ -27,6 +27,7 @@ import { DOCKER_IN_DOCKER_FEATURE, DOCKER_OUTSIDE_OF_DOCKER_FEATURE, BASE_IMAGE,
 import type { Scaffold } from "./scaffold.js";
 import { collectionsIn, featuresInCollection, loadCatalog, parseFeaturesPage, parseRef, publishedVersions, searchFeatures } from "./features-index.js";
 import { MAX_DISPLAY_BYTES_FOR_TEST, OutputTail } from "./render.js";
+import { parseListeningPorts, parseSocatListenPort, socatArgs } from "./ports.js";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import type { DevcontainerConfig } from "./types.js";
 
@@ -1029,6 +1030,74 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	check("a socket config is reported as a host socket", describeDockerAccess({ features: { [DOCKER_OUTSIDE_OF_DOCKER_FEATURE]: {} } }).mode, "host-socket");
 	check("a config with no docker feature reports none", describeDockerAccess({ image: "x" }).mode, "none");
 	check("a dind feature at another major is still recognized", describeDockerAccess({ features: { "ghcr.io/devcontainers/features/docker-in-docker:2": {} } }).mode, "dind");
+}
+
+// --- auto port forwarding: high host ports, announced as FROM->TO -------
+// The mechanism rests on three claims, each checkable without a container:
+// the kernel's own table can be read, socat is asked for port 0 so the kernel
+// picks a free port, and the resulting mapping is announced rather than
+// recorded somewhere nobody will look.
+{
+	// Real /proc/net/tcp output: 0A is TCP_LISTEN, and the port is the second
+	// half of a host-order-reversed hex address.
+	const proc = [
+		"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+		"   0: 00000000:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12 1 0000 100 0 0 10 0",
+		"   1: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 13 1 0000 100 0 0 10 0",
+		"   2: 00000000:C351 0100007F:1F90 01 00000000:00000000 00:00000000 00000000     0        0 14 1 0000 100 0 0 10 0",
+		"",
+	].join("\n");
+	const ports = parseListeningPorts(proc);
+	check("a listening port is parsed from /proc/net/tcp", ports.includes(3000), true);
+	check("a loopback listener is parsed too", ports.includes(8080), true);
+	// 0C35 is 50001 in the line above and its state is 01 (ESTABLISHED), not
+	// 0A: a relay built from it would forward nothing and look broken.
+	check("an established connection is not a listening port", ports.includes(50001), false);
+	checkTrue("ports come back sorted", ports.every((p, i) => i === 0 || (ports[i - 1] ?? 0) < p), ports.join(","));
+
+	// A truncated or foreign line must not become a port.
+	checkTrue("garbage yields no ports", parseListeningPorts("not a proc line\n\n  \n").length === 0, "garbage");
+
+	// socat binds port 0 so the KERNEL chooses: a check-then-bind race would
+	// hand the user a port that was taken between the two.
+	const args = socatArgs("172.17.0.3", 3000);
+	// -d prints warnings only; which port it bound is only visible at the
+	// second level, and that line is the only statement of the mapping.
+	checkTrue("socat is verbose enough to report the port it bound", (args[0] ?? "") === "-d" && (args[1] ?? "") === "-d", args.join(" "));
+	const listen = args[2] ?? "";
+	const target = args[3] ?? "";
+	checkTrue("socat is asked for a kernel-chosen port", listen.includes("LISTEN:0,"), listen);
+	checkTrue("socat binds loopback only", listen.includes("bind=127.0.0.1"), listen);
+	checkTrue("socat forks per connection", listen.includes("fork"), listen);
+	check("socat is pointed at the container's address and port", target, "TCP4:172.17.0.3:3000");
+
+	// The reported host port comes from socat's own line, never from a guess.
+	// Both wordings are real: -d prints the first, a failure the second.
+	check("socat's listening-on line yields the port", parseSocatListenPort("2026/09/30 14:49:34 socat[78874] N listening on AF=2 127.0.0.1:34951"), 34951);
+	check("socat's LISTEN line yields the port", parseSocatListenPort("2024/01/01 12:00:00 socat[1] E LISTEN 0.0.0.0:41234"), 41234);
+	check("a line without a port yields none", parseSocatListenPort("socat[1] E connect(0, AF=2): Connection refused"), 0);
+	// A low number is not a high port, so a line quoting the container's own
+	// port must not be reported as the mapping.
+	check("a port outside the high range is rejected", parseSocatListenPort("LISTEN 0.0.0.0:3000"), 0);
+
+	// The mapping has to reach both audiences: the user (a notice) and the
+	// model (the tool result). Either alone leaves the other guessing.
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	const portsSource = readFileSync(new URL("../ports.ts", import.meta.url), "utf8");
+	checkTrue("the mapping is announced to the user", portsSource.includes("container port ${containerPort} -> host 127.0.0.1:${hostPort}"), "notice");
+	checkTrue("the mapping is in the tool result", source.includes("${p.containerPort} -> 127.0.0.1:${p.hostPort}"), "header");
+	checkTrue("the model is told localhost:<container port> is not the service", source.includes("NOT the container"), "guideline");
+	checkTrue("a ports command lists the mapping", source.includes('registerCommand("devcontainer-ports"'), "command");
+	// Declared forwardPorts are published by `up` itself; relaying them again
+	// would give one service two URLs.
+	checkTrue("already-published ports are not relayed again", portsSource.includes("this.declared.has(port)"), "skip");
+	// The CLI names its own container, so the extension must look it up by
+	// label rather than inspect the name it invented for its own container.
+	checkTrue("the CLI container is found by its label", portsSource.includes("devcontainer.local_folder"), "label");
+	// A relay must not outlive the session that bound host ports for it.
+	checkTrue("the forwarder is stopped at shutdown", source.includes("forwarder?.stop()"), "stop");
+	// The container's own infrastructure is not published.
+	checkTrue("debug and daemon ports are skipped", portsSource.includes("SKIP_PORTS"), "SKIP_PORTS");
 }
 
 console.log(failures === 0 ? `\nALL ${checks} CHECKS PASSED` : `\n${failures}/${checks} CHECKS FAILED`);

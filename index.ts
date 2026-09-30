@@ -72,6 +72,7 @@ import { ensureReady, runInContainer } from "./run-in-container.js";
 import { createDevcontainerRenderers, OutputTail, UPDATE_THROTTLE_MS, type DevcontainerDetails } from "./render.js";
 import { collectionsIn, featuresInCollection, loadCatalog, publishedVersions, searchFeatures, type CatalogFeature } from "./features-index.js";
 import { asJsonObject, parseJsonc } from "./jsonc.js";
+import { PortForwarder, findCliContainer } from "./ports.js";
 import { BringUpLog, describePhase, startProgressWidget } from "./progress.js";
 import { BASE_IMAGES, describeDockerAccess, detectStack, projectProfile, scaffold } from "./scaffold.js";
 import type { DevcontainerConfig } from "./types.js";
@@ -117,8 +118,41 @@ export default function (pi: ExtensionAPI) {
 	// re-awaiting an already-rejected promise on every later call.
 	let catalogFailure: string | null = null;
 
-	const notify = (msg: string, level: "info" | "warning" | "error") => {
-		if (!shuttingDown) lastUi?.notify?.(msg, level);
+	const notify = (msg: string, level?: "info" | "warning" | "error") => {
+		if (!shuttingDown) lastUi?.notify?.(msg, level ?? "info");
+	};
+
+	// The session's forwarder, stopped at shutdown. Kept module-scoped because
+	// a relay outliving the session that asked for it would keep host ports
+	// bound after the user has moved on.
+	let forwarder: PortForwarder | undefined;
+
+	/**
+	 * Publish container ports on the host as the container opens them, and
+	 * tell the user the FROM->TO mapping each time one appears.
+	 *
+	 * The mapping is announced rather than merely recorded because a port you
+	 * have to go looking for is a port you will not use: the point of
+	 * forwarding is that the host can reach a server the developer just
+	 * started inside the container, and the host port is not derivable from
+	 * the container port by design (see ports.ts).
+	 */
+	const startPortForwarder = async (c: DevcontainerConfig, say: (message: string, level?: "info" | "warning" | "error") => void): Promise<void> => {
+		// The CLI names its own container; the name this extension invents is
+		// for the docker-fallback container only. Both modes are covered,
+		// because neither is the other's container.
+		const container = c.useCli ? await findCliContainer(c.configRoot) : c.containerName;
+		if (!container) return;
+		const f = new PortForwarder(container, {
+			onNotice: say,
+			// The tool result repeats the mapping for the model, which cannot
+			// see a status-bar notice; the user's own copy comes from here.
+			onPublished: () => {},
+		});
+		await f.noteDeclaredPorts();
+		f.start();
+		forwarder?.stop();
+		forwarder = f;
 	};
 
 	// Changing the active tool set is transcript-visible (pi appends it before
@@ -164,6 +198,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Run a shell command inside this project's devcontainer",
 		promptGuidelines: [
 			"`bash` runs on the host filesystem; the `devcontainer` tool runs inside the container. Build, test and dependency commands that need the container's toolchain belong in `devcontainer`; file inspection and editing belong in `read`/`edit`/`write`, which use the host path this tool reports.",
+			"Container ports are published on the host on a free HIGH port, not on the container's own number, so `localhost:<container port>` is NOT the container's service — use the `container -> host` mapping this tool reports, and `curl` the host port from the `bash` tool, which runs outside the container.",
 		],
 		parameters: Type.Object({
 			command: Type.String({ description: "Shell command to run inside the container" }),
@@ -293,10 +328,16 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const truncated = truncateTail(result.output, params.tail === undefined ? undefined : { maxLines: params.tail });
+			const forwardPorts = forwarder?.list() ?? [];
 			const header = [
 				`container cwd: ${result.containerCwd}`,
 				`host cwd: ${result.hostCwd}`,
 				`exit code: ${result.exitCode}`,
+				// The mapping the model cannot derive: container ports are
+				// published on a free HIGH host port, so "localhost:3000" is
+				// not the container's 3000 and guessing it tests the wrong
+				// process.
+				...(forwardPorts.length > 0 ? [`published ports: ${forwardPorts.map((p) => `${p.containerPort} -> 127.0.0.1:${p.hostPort}`).join(", ")}`] : []),
 			].join("\n");
 			const text = [
 				header,
@@ -526,6 +567,10 @@ export default function (pi: ExtensionAPI) {
 					`Devcontainer ready: ${c.containerName} — the devcontainer tool runs commands with cwd ${c.remoteWorkspace ?? "(container default)"} (host: ${c.projectCwd})`,
 					"info",
 				);
+				// Only once the container is up: relaying ports of a container
+				// that is still being built reports nothing, and a poll loop
+				// racing `up` would need to be told when to start.
+				void startPortForwarder(c, notify);
 			})();
 		} else {
 			// docker fallback: bring the container up in the background (a
@@ -1031,6 +1076,20 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("devcontainer-ports", {
+		description: "list the container ports pi has published on the host",
+		handler: async (_args, cmdCtx) => {
+			const ui = cmdCtx?.ui ?? lastUi;
+			const list = forwarder?.list() ?? [];
+			ui?.notify?.(
+				list.length > 0
+					? list.map((p) => `devcontainer: container ${p.containerPort} -> host 127.0.0.1:${p.hostPort}`).join("\n")
+					: "devcontainer: no container ports are published on the host yet — start a server in the container and they appear here",
+				"info",
+			);
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx: ExtensionContext) => {
 		lastUi = ctx.ui;
 		sessionCwd = ctx.cwd;
@@ -1049,6 +1108,11 @@ export default function (pi: ExtensionAPI) {
 		// notifications (or hold the process open) after the session ends.
 		shuttingDown = true;
 		active = false;
+		// Host ports bound by a relay outlive the session that asked for them,
+		// so the forwarder is stopped here rather than left to its unref'd
+		// timer, which would keep publishing until the next process ends.
+		forwarder?.stop();
+		forwarder = undefined;
 		cfg = null;
 		lastUi = null;
 		sessionCwd = null;
