@@ -78,7 +78,7 @@ import type { DevcontainerConfig } from "./types.js";
 
 const TOOL_NAME = "devcontainer";
 const CREATE_TOOL_NAME = "create_devcontainer";
-const REBUILD_TOOL_NAME = "rebuild_devcontainer";
+const REBUILD_TOOL_NAME = "devcontainer_rebuild";
 const DEFAULT_TIMEOUT = 120;
 /**
  * How long one call waits for a still-running bring-up before reporting that
@@ -854,7 +854,7 @@ export default function (pi: ExtensionAPI) {
 		].join("\n"),
 		promptSnippet: "Rebuild this project's devcontainer image from its config",
 		promptGuidelines: [
-			"After editing `.devcontainer/devcontainer.json`, a `dockerFile` or a compose file, call `rebuild_devcontainer` so the running container matches the change.",
+			"After editing `.devcontainer/devcontainer.json`, a `dockerFile` or a compose file, call `devcontainer_rebuild` so the running container matches the change.",
 		],
 		parameters: Type.Object({
 			extraArgs: Type.Optional(

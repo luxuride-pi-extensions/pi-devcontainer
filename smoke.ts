@@ -914,12 +914,17 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	}
 }
 
-// --- rebuild_devcontainer: a rebuild is bring-up with an argument -------
+// --- devcontainer_rebuild: a rebuild is bring-up with an argument -----
 // The tool exists because a config edit does not always reach the container on
 // its own, and the fix has to be a re-run of `up` rather than a second,
 // parallel build path that would drift from it.
 {
 	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	// The naming is a convention, not decoration: every tool this extension
+	// offers is called devcontainer_<action>, and a model choosing between
+	// tools reads the name before it reads the description.
+	checkTrue("the rebuild tool is named devcontainer_rebuild", source.includes('REBUILD_TOOL_NAME = "devcontainer_rebuild"'), "name");
+	checkTrue("no stale name is left in the source", !source.includes("rebuild_devcontainer"), "stale name");
 	checkTrue("the rebuild tool is registered", source.includes("pi.registerTool(rebuildTool)"), "registerTool(rebuildTool)");
 	// It has to ride the run tool's activation: a rebuild before the container
 	// is up would only report the same wait, worse.
