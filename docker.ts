@@ -11,7 +11,7 @@ export async function ensureDockerContainer(cfg: DevcontainerConfig, onData?: (d
 	const inspect = await run("docker", ["inspect", "-f", "{{.State.Status}}", name]);
 	if (inspect.code === 0) {
 		if (inspect.stdout.trim() === "running") return;
-		await run("docker", ["start", name], onData);
+		await run("docker", ["start", name], onData, 0);
 		return;
 	}
 	// Container does not exist - create it, mounting the config root
@@ -26,6 +26,10 @@ export async function ensureDockerContainer(cfg: DevcontainerConfig, onData?: (d
 	// skipped while the container exists, so changing this mount requires
 	// `docker rm` first.
 	const mount = `${cfg.workspaceFolder}:${cfg.workspaceFolder}`;
+	// Uncapped: this is where a first-run image pull happens, and the pull
+	// makes steady progress for the whole time it runs (no output here, but
+	// `docker run` with a local image exits in seconds — only the pull is
+	// long, and that is exactly the case the cap must not break).
 	const r = await run(
 		"docker",
 		[
@@ -47,6 +51,7 @@ export async function ensureDockerContainer(cfg: DevcontainerConfig, onData?: (d
 			"/dev/null",
 		],
 		onData,
+		0,
 	);
 	if (r.code !== 0) throw new Error(`docker run failed: ${r.stderr.trim()}`);
 }

@@ -52,7 +52,7 @@ export async function provisionContainer(
 	const bash = (script: string): [string, ...string[]] => [prefix, ...execPrefix.slice(1), "bash", "-lc", script, "pi-override", marker];
 	const runBash = (script: string) => {
 		const argv = bash(script);
-		return run(argv[0], argv.slice(1));
+		return run(argv[0], argv.slice(1), undefined, 0);
 	};
 	let markerExists = false;
 	try {
@@ -65,7 +65,7 @@ export async function provisionContainer(
 	let allOk = true;
 	for (const cmd of provision) {
 		try {
-			const r = await run(prefix, [...execPrefix.slice(1), "bash", "-lc", cmd]);
+			const r = await run(prefix, [...execPrefix.slice(1), "bash", "-lc", cmd], undefined, 0);
 			if (r.code !== 0) {
 				allOk = false;
 				const detail = (r.stderr.trim() || r.stdout.trim()).split("\n").slice(-3).join(" ");
