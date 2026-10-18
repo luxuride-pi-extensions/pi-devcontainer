@@ -60,10 +60,22 @@ best-effort: a failure warns and the tools stay available.
 ```bash
 pi install npm:@luxuride-pi/devcontainer
 # or, from the clone:
-pi install git:github.com/luxuride-pi-extensions/pi-devcontainer
+pi install git:github.com/luxuride-pi-extensions/pi-devcontainer@v<version>
 ```
 
 The extension is TypeScript loaded from source; there is no build step.
+
+## Releases
+
+Every release is both a **git tag** and an npm package. The package publishes
+as `@luxuride-pi/devcontainer` from the release workflow via npm trusted
+publishing (OIDC from GitHub Actions — no publish token exists anywhere).
+
+To cut a release: bump `version` in `package.json` on its own commit, tag that
+commit (`git tag v<version> && git push origin master --tags`), and
+`.github/workflows/release.yml` packs, checks, and publishes the release. The
+workflow fails when the tag is not on the released commit or does not match
+`package.json`'s version.
 
 ## Development
 
