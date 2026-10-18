@@ -553,7 +553,9 @@ export default function (pi: ExtensionAPI) {
 			const log = new BringUpLog();
 			c.bringUpLog = log;
 			c.pendingUp = (async () => {
-				const up = await run("devcontainer", upArgs, (d) => log.append(d.toString()));
+				// Uncapped: a first-run pull can run for many minutes and makes
+				// steady progress the whole time (see run()'s timeout contract).
+				const up = await run("devcontainer", upArgs, (d) => log.append(d.toString()), 0);
 				if (up.code !== 0) {
 					const detail = up.stderr.trim().split("\n").slice(0, 3).join(" ");
 					throw new Error(detail || `devcontainer up exited ${up.code}`);

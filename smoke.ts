@@ -22,7 +22,7 @@ import { alreadyInContainer, loadDevcontainerJson } from "./config.js";
 import { provisionContainer } from "./provision.js";
 import { containerAlive, resolveToolCwd, runInContainer, settleBringUp } from "./run-in-container.js";
 import { BringUpLog, describePhase, startProgressWidget } from "./progress.js";
-import { shq } from "./exec.js";
+import { DEFAULT_RUN_TIMEOUT, shq, run } from "./exec.js";
 import { DOCKER_IN_DOCKER_FEATURE, DOCKER_OUTSIDE_OF_DOCKER_FEATURE, BASE_IMAGE, BASE_IMAGES, DOTNET_FEATURE, NODE_FEATURE, STACK_FEATURES, baseImageFor, describeDockerAccess, featureFor, projectProfile, scaffold, stackIds } from "./scaffold.js";
 import type { Scaffold } from "./scaffold.js";
 import { collectionsIn, featuresInCollection, loadCatalog, parseFeaturesPage, parseRef, publishedVersions, searchFeatures } from "./features-index.js";
@@ -78,6 +78,60 @@ check("shq with spaces", shq("a b"), "'a b'");
 check("shq escapes single quote", shq("a'b"), "'a'\\''b'");
 
 checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "boolean");
+
+// --- bounded run -------------------------------------------------------
+// A docker daemon wedged mid-request answers nothing and never exits, so an
+// unbounded run() would freeze ensureReady with nothing on screen. The cap
+// must kill the child and reject with a message naming the command.
+{
+	const bin = mkdtempSync(join(tmpdir(), "dc-runto-bin-"));
+	const slow = join(bin, "slowcmd");
+	writeFileSync(slow, "#!/bin/sh\necho started\nsleep 30\n");
+	chmodSync(slow, 0o755);
+	const prevPath = process.env.PATH;
+	process.env.PATH = `${bin}:${prevPath ?? ""}`;
+	try {
+		const t0 = Date.now();
+		let err = "";
+		try {
+			await run("slowcmd", [], undefined, 1);
+		} catch (e) {
+			err = e instanceof Error ? e.message : String(e);
+		}
+		const elapsed = Date.now() - t0;
+		checkTrue("a hung command is rejected by the cap", err.includes("timed out after 1s"), err);
+		check("the message names the command", err, "host command 'slowcmd' timed out after 1s with no output or exit");
+		checkTrue("the kill happens at the cap, not after the sleep", elapsed < 5000, elapsed);
+
+		// The default cap exists and is sane — a constant typed wrongly would
+		// silently change every bounded call's budget.
+		check("the default cap is 60 seconds", DEFAULT_RUN_TIMEOUT, 60);
+
+		// Output produced BEFORE the cap still reaches onData: the caller's
+		// progress stream is fed up to the kill.
+		const seen: string[] = [];
+		try {
+			await run("slowcmd", [], (d) => seen.push(d.toString().trim()), 1);
+		} catch {
+			// expected
+		}
+		check("output before the kill reaches onData", seen.join("|"), "started");
+
+		// timeoutSeconds = 0 disables the cap: the sleep finishes and the
+		// exit code still arrives. This is what bring-up passes.
+		const uncapped = await run("slowcmd", [], undefined, 0);
+		check("timeout 0 means no cap", uncapped.code, 0);
+
+		// A fast command resolves normally with the cap in place.
+		writeFileSync(slow, "#!/bin/sh\necho done\n");
+		const fast = await run("slowcmd", []);
+		check("a fast command still resolves", fast.code, 0);
+		check("its stdout arrives", fast.stdout.trim(), "done");
+	} finally {
+		process.env.PATH = prevPath;
+		rmSync(bin, { recursive: true, force: true });
+	}
+}
 
 // --- config discovery --------------------------------------------------
 {
