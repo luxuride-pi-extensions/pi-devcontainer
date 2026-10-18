@@ -272,7 +272,7 @@ export async function publishedVersions(reference: string): Promise<{ ref: strin
 	const cached = readCache<PublishedVersion[]>(cacheKey);
 	if (cached && Date.now() - cached.fetchedAt <= TTL_MS) return { ref: repo, versions: cached.data };
 
-	const token = await registryToken(parsed.host);
+	const token = await registryToken(parsed.host, repo);
 	const listed = (await (
 		await fetch(`https://${parsed.host}/v2/${repo}/tags/list?n=1000`, {
 			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
@@ -293,10 +293,13 @@ export async function publishedVersions(reference: string): Promise<{ ref: strin
 	return { ref: repo, versions };
 }
 
-async function registryToken(host: string): Promise<string> {
-	// ghcr.io's anonymous token endpoint; a different host may not need one,
-	// and a token it rejects is not fatal — the manifest fetch just proceeds.
-	const scope = encodeURIComponent(`repository:devcontainers/features:pull`);
+async function registryToken(host: string, repo: string): Promise<string> {
+	// The anonymous token endpoint, scoped to the ONE repository being read:
+	// a scope naming a repo that does not exist is rejected outright (ghcr.io
+	// answers NAME_INVALID), so `repository:devcontainers:pull` — an owner
+	// passed off as a repo — never yields a token, and a registry that does
+	// require one would fail every manifest fetch.
+	const scope = encodeURIComponent(`repository:${repo}:pull`);
 	try {
 		const res = await fetch(`https://${host}/token?scope=${scope}&service=${host}`, {
 			signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),

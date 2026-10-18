@@ -739,7 +739,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// No arguments: report and change nothing.
-			const wantsWrite = params.image !== undefined || params.features !== undefined || params.name !== undefined || params.postCreateCommand !== undefined || params.forwardPorts !== undefined || params.stack !== undefined;
+			const wantsWrite = params.image !== undefined || params.features !== undefined || params.name !== undefined || params.postCreateCommand !== undefined || params.forwardPorts !== undefined || params.stack !== undefined || params.shareHostDocker !== undefined;
 			const profile = projectProfile(projectRoot);
 
 			// A targeted lookup: the model already knows what it wants, so skip
@@ -833,6 +833,7 @@ export default function (pi: ExtensionAPI) {
 			const defaults = scaffold({
 				projectRoot,
 				stack: effectiveStack,
+				image: params.image,
 				features: params.features as Record<string, Record<string, unknown>> | undefined,
 				postCreateCommand: params.postCreateCommand,
 				forwardPorts: params.forwardPorts as (number | string)[] | undefined,

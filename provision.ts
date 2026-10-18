@@ -62,7 +62,8 @@ export async function provisionContainer(
 	}
 	if (markerExists) return;
 	notify(`Provisioning devcontainer (${provision.length} command(s), one-time)...`, "info");
-	let allOk = true;	for (const cmd of provision) {
+	let allOk = true;
+	for (const cmd of provision) {
 		try {
 			const r = await run(prefix, [...execPrefix.slice(1), "bash", "-lc", cmd]);
 			if (r.code !== 0) {

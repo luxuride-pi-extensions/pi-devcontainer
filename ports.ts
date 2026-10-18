@@ -40,9 +40,12 @@ const POLL_MS = 3000;
 const SKIP_PORTS = new Set([
 	// The devcontainer CLI's own exec server, bound inside the container.
 	22, 23, 2375, 2376, 6443,
-	// Language runtimes and package managers' debug ports talk to a client
-	// that is expected to be inside the container, and publishing them
-	// forwards an unauthenticated debugger to the loopback interface.
+	// Language runtimes' debug ports talk to a client that is expected to be
+	// inside the container, and publishing them forwards an unauthenticated
+	// debugger to the loopback interface.
+	9229, // node --inspect
+	9230, // node --inspect secondary port
+	5858, // dart/flutter debug
 ]);
 
 export interface ForwardedPort {
