@@ -1,13 +1,13 @@
 {
-	"name": "pi-devcontainer",
+	"name": "@luxuride-pi/devcontainer",
 	"version": "0.1.1",
 	"description": "pi extension: run project commands inside the project's devcontainer",
 	"keywords": [
-		"pi-extension",
 		"devcontainer",
-		"docker"
+		"docker",
+		"pi-extension",
+		"pi-package"
 	],
-	"private": true,
 	"type": "module",
 	"license": "MIT",
 	"files": [

@@ -58,6 +58,8 @@ best-effort: a failure warns and the tools stay available.
 ## Install
 
 ```bash
+pi install npm:@luxuride-pi/devcontainer
+# or, from the clone:
 pi install git:github.com/luxuride-pi-extensions/pi-devcontainer
 ```
 

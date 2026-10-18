@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -73,6 +74,17 @@ jobs:
 
       - name: smoke tests
         run: npm test
+
+      # Publishes to npm as @luxuride-pi/devcontainer via npm trusted
+      # publishing (OIDC): the registry exchange is derived from the workflow's
+      # own identity, so there is no NPM_TOKEN secret and nothing to rotate.
+      # The npmjs.com side is configured once under
+      # Packages → devcontainer → Settings → Trusted publisher: repository
+      # luxuride-pi-extensions/pi-devcontainer, workflow filename release.yml.
+      # Node 22 covers the CLI's OIDC support (npm >= 11.5.1); id-token: write
+      # is what makes the token mintable at all.
+      - name: publish to npm
+        run: npm publish --access public --provenance
 
       - name: pack
         run: |
