@@ -59,8 +59,6 @@ best-effort: a failure warns and the tools stay available.
 
 ```bash
 pi install npm:@luxuride-pi/devcontainer
-# or, from the clone:
-pi install git:github.com/luxuride-pi-extensions/pi-devcontainer@v<version>
 ```
 
 The extension is TypeScript loaded from source; there is no build step.
@@ -71,19 +69,32 @@ Every release is both a **git tag** and an npm package. The package publishes
 as `@luxuride-pi/devcontainer` from the release workflow via npm trusted
 publishing (OIDC from GitHub Actions — no publish token exists anywhere).
 
-To cut a release: bump `version` in `package.json` on its own commit, tag that
-commit (`git tag v<version> && git push origin master --tags`), and
-`.github/workflows/release.yml` packs, checks, and publishes the release. The
-workflow fails when the tag is not on the released commit or does not match
-`package.json`'s version.
+pi can also install this extension from a **git ref**: pi clones, checks out
+the ref, runs `npm install --legacy-peer-deps`, and loads the extension's
+TypeScript straight from source — so a tag *is* the artifact; there is no
+build step and nothing to compile.
 
-## Development
+### Install a release
 
 ```bash
-npm install --legacy-peer-deps
-npm run typecheck   # tsc --noEmit
-npm test            # 248 smoke checks (JSONC, quoting, config discovery, cwd resolution, ports, scaffold, catalog parsing)
+pi install npm:@luxuride-pi/devcontainer@^<version>
+# or, pinned to a git tag:
+pi install git:github.com/luxuride-pi-extensions/pi-devcontainer@v<version>
 ```
+
+### Cut a release
+
+1. Bump `version` in `package.json` and commit that on its own.
+2. Tag the commit that contains the bump — the tag and the version must agree:
+   ```bash
+   git tag v<version> && git push origin master --tags
+   ```
+3. `.github/workflows/release.yml` packs the tarball, checks it, and publishes
+   the release with generated notes.
+
+The workflow refuses to guess: it fails when the tag is not on the commit being
+released, and again when the tag does not match `package.json`'s `version`.
+Bump the version *before* tagging; the tag is not the place to bump.
 
 ## License
 
