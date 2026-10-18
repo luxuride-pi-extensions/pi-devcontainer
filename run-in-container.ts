@@ -2,7 +2,8 @@ import { spawn } from "node:child_process";
 import { isAbsolute, relative, resolve } from "node:path";
 
 import { ensureDockerContainer } from "./docker.js";
-import { shq } from "./exec.js";
+import { run, shq } from "./exec.js";
+import { findCliContainer } from "./ports.js";
 import { startProgressWidget } from "./progress.js";
 import type { BringUpProgress, WidgetUi } from "./progress.js";
 import type { DevcontainerConfig } from "./types.js";
@@ -314,4 +315,35 @@ export function runInContainer(
 export async function ensureReady(cfg: DevcontainerConfig, opts: SettleOptions): Promise<void> {
 	await settleBringUp(cfg, opts);
 	if (!cfg.useCli) await ensureDockerContainer(cfg);
+}
+
+/** Result of probing the container the config points at. */
+export interface ContainerAlive {
+	/** True when the container exists and is running. */
+	alive: boolean;
+	/** The real container name found, when one was found. */
+	containerName: string | null;
+}
+
+/**
+ * Is the container the config points at actually running?
+ *
+ * CLI mode: `devcontainer up` names its own container and labels it with the
+ * workspace folder, so the container is found by its label (the same lookup
+ * the port forwarder uses) — a name invented here would never match.
+ * Docker-fallback mode: the container is the one this extension created,
+ * so its name is known.
+ */
+export async function containerAlive(cfg: DevcontainerConfig): Promise<ContainerAlive> {
+	let name: string | null = null;
+	if (cfg.useCli) {
+		const found = await findCliContainer(cfg.configRoot);
+		if (!found) return { alive: false, containerName: null };
+		name = found;
+	} else {
+		name = cfg.containerName;
+	}
+	const r = await run("docker", ["inspect", "-f", "{{.State.Status}}", name]);
+	if (r.code !== 0) return { alive: false, containerName: name };
+	return { alive: r.stdout.trim() === "running", containerName: name };
 }

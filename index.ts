@@ -68,7 +68,7 @@ import { ensureDockerContainer } from "./docker.js";
 import { run } from "./exec.js";
 import { loadGlobalOverride } from "./override.js";
 import { provisionContainer } from "./provision.js";
-import { ensureReady, runInContainer } from "./run-in-container.js";
+import { containerAlive, ensureReady, runInContainer } from "./run-in-container.js";
 import { createDevcontainerRenderers, OutputTail, UPDATE_THROTTLE_MS, type DevcontainerDetails } from "./render.js";
 import { collectionsIn, featuresInCollection, loadCatalog, publishedVersions, searchFeatures, type CatalogFeature } from "./features-index.js";
 import { asJsonObject, parseJsonc } from "./jsonc.js";
@@ -302,7 +302,40 @@ export default function (pi: ExtensionAPI) {
 					schedule();
 				},
 				signal,
-			);
+			).catch(async (err: unknown) => {
+				// A container that died between bring-up and this call fails at
+				// exec with "no such container"; one re-up and the command runs
+				// against the fresh container instead of surfacing the raw error.
+				const recovered = await reUpAfterDeath(err, async (fresh) => {
+					await ensureReady(fresh, {
+						isEnabled: () => active,
+						onProgress: (line) => {
+							tail.append(line);
+							schedule();
+						},
+						signal,
+						ui: ctx?.ui,
+						waitBudgetSeconds: params.waitForContainer,
+					});
+				});
+				if (!recovered) throw err;
+				const tailBefore = pending;
+				tail.reset();
+				const retried = await runInContainer(
+					cfg as DevcontainerConfig,
+					{ ...params, timeout },
+					(chunk) => {
+						tail.append(chunk.toString());
+						schedule();
+					},
+					signal,
+				);
+				if (tailBefore) {
+					clearTimeout(tailBefore);
+					pending = undefined;
+				}
+				return retried;
+			});
 			if (pending) {
 				clearTimeout(pending);
 				pending = undefined;
@@ -658,6 +691,45 @@ export default function (pi: ExtensionAPI) {
 		// wait. The comment on the declaration says "returns immediately", and
 		// that promise is the whole reason the tools carry a wait budget.
 		void cfg.pendingUp;
+	};
+
+	/**
+	 * Recover from a container that died after its bring-up settled — a docker
+	 * daemon restart, a `docker rm`, an OOM kill. `cfg.pendingUp` resolves
+	 * once and for all, so `ensureReady` alone would let the exec fail with a
+	 * raw "no such container".
+	 *
+	 * Returns true when the container was found dead, brought back up (once),
+	 * and the given `settle` awaiter — re-read from the module `cfg`, which
+	 * bringUp replaced — resolved. Anything else (container alive, a still
+	 * failing bring-up, a session without a project) returns false and the
+	 * original exec error stands.
+	 */
+	const reUpAfterDeath = async (
+		error: unknown,
+		settle: (fresh: DevcontainerConfig) => Promise<void>,
+	): Promise<boolean> => {
+		if (!sessionCwd) return false;
+		const message = error instanceof Error ? error.message : String(error);
+		// docker exec / devcontainer exec fail differently on a missing
+		// container; both name it. Probing (not string-matching alone) is what
+		// decides: a command that merely failed INSIDE a live container must
+		// not trigger a re-up.
+		const dead = /no such container|is not running/i.test(message);
+		if (!dead) return false;
+		const before = cfg;
+		if (!before) return false;
+		const alive = await containerAlive(before);
+		if (alive.alive) return false;
+		notify(`devcontainer container ${alive.containerName ?? before.containerName ?? "(unknown)"} is gone (${(message.split("\n")[0] ?? message).trim()}); bringing it back up...`, "warning");
+		// bringUp replaces `cfg` with a fresh config carrying a new pendingUp;
+		// the old config's promise is spent and can never settle again.
+		if (bringUpInFlight) return false;
+		await bringUp(sessionCwd, []);
+		const fresh = cfg;
+		if (!fresh || fresh === before || !fresh.pendingUp) return false;
+		await settle(fresh);
+		return true;
 	};
 
 	/**
