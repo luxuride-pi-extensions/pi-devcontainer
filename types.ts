@@ -6,6 +6,13 @@ export interface DevcontainerConfig {
 	canonicalCwd: string;
 	/** canonical directory that contains the .devcontainer config (the container's mount root) */
 	configRoot: string;
+	/** Path of the devcontainer.json that was loaded. */
+	configPath: string;
+	/** True when configPath is <configRoot>/.devcontainer/devcontainer.json —
+	 *  the one location `devcontainer up/exec` finds on its own. Anything else
+	 *  (a named config, the legacy bare file, a config above the project) is
+	 *  passed to the CLI as an explicit --config. */
+	configDefaulted: boolean;
 	containerName: string;
 	image?: string;
 	/**

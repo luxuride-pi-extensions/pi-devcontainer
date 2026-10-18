@@ -227,8 +227,11 @@ export function runInContainer(
 ): Promise<RunResult> {
 	const { containerCwd, hostCwd } = resolveToolCwd(cfg, params.cwd);
 	const script = `cd ${shq(containerCwd)} && ${params.command}`;
+	// --config is needed only when the config file is NOT at the default
+	// location the CLI resolves by itself (see DevcontainerConfig.configDefaulted).
+	const cliArgs = cfg.useCli && !cfg.configDefaulted ? ["--config", cfg.configPath] : [];
 	const argv: [string, ...string[]] = cfg.useCli
-		? ["devcontainer", "exec", "--workspace-folder", cfg.workspaceFolder, "--", "bash", "-c", script]
+		? ["devcontainer", "exec", "--workspace-folder", cfg.workspaceFolder, ...cliArgs, "--", "bash", "-c", script]
 		: ["docker", "exec", "-i", cfg.containerName, "bash", "-c", script];
 
 	return new Promise<RunResult>((resolvePromise, reject) => {
