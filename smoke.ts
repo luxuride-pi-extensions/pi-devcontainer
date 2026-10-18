@@ -90,18 +90,55 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		const found = loadDevcontainerJson(tmp);
 		checkTrue("config found under .devcontainer", found.path === join(tmp, ".devcontainer", "devcontainer.json"));
 		check("image parsed through JSONC", found.config?.image, "alpine:3");
-		checkTrue("root is the config dir", found.root === tmp);
+		checkTrue("root is the searched directory", found.root === tmp);
+		checkTrue("the default location is not named", found.multi === null);
 
-		// Only the project dir is searched: a parent config must NOT be picked up.
+		// The parent chain is searched when the project dir has no config of
+		// its own. `root` stays the searched directory — the workspace the
+		// container should mount — not the directory that holds the config;
+		// the caller passes --config to the CLI when the file is elsewhere.
 		const child = join(tmp, "child");
 		mkdirSync(child);
-		checkTrue("no upward search into parent", loadDevcontainerJson(child).path === null);
+		const fromChild = loadDevcontainerJson(child);
+		checkTrue("config found in the parent directory", fromChild.path === join(tmp, ".devcontainer", "devcontainer.json"));
+		checkTrue("a parent config's root is the child", fromChild.root === child);
+		checkTrue("a parent config reports its own configDir", fromChild.configDir === join(tmp, ".devcontainer"));
+		checkTrue("a parent config is not named", fromChild.multi === null);
 
-		// Unparseable config reports the path but no config.
-		writeFileSync(join(tmp, "child", "devcontainer.json"), "{ this is not json");
-		const bad = loadDevcontainerJson(child);
-		checkTrue("broken config has path", bad.path === join(child, "devcontainer.json"));
-		checkTrue("broken config has null config", bad.config === null);
+		// Named subdirectory configs: the first sorted name wins, and the
+		// winner is reported so several configs can be told apart.
+		mkdirSync(join(tmp, "child", ".devcontainer", "java-8"), { recursive: true });
+		mkdirSync(join(tmp, "child", ".devcontainer", "java-17"), { recursive: true });
+		writeFileSync(join(tmp, "child", ".devcontainer", "java-17", "devcontainer.json"), '{"image":"mcr.microsoft.com/devcontainers/java:17"}');
+		writeFileSync(join(tmp, "child", ".devcontainer", "java-8", "devcontainer.json"), '{"image":"mcr.microsoft.com/devcontainers/java:8"}');
+		const named = loadDevcontainerJson(child);
+		checkTrue("a named config beats the parent's config", named.path === join(child, ".devcontainer", "java-17", "devcontainer.json"));
+		checkTrue("the named config is reported", named.multi === "java-17");
+		check("the named config's image parses", named.config?.image, "mcr.microsoft.com/devcontainers/java:17");
+		checkTrue("a named config's root is still the searched dir", named.root === child);
+		checkTrue("a named config's configDir is its own directory", named.configDir === join(child, ".devcontainer", "java-17"));
+		checkTrue("the default location beats named configs", loadDevcontainerJson(tmp).path === join(tmp, ".devcontainer", "devcontainer.json"));
+
+		// A directory without a config whose parents have none either finds
+		// nothing, without walking forever at the filesystem root.
+		const bare = mkdtempSync(join(tmpdir(), "dc-bare-"));
+		try {
+			checkTrue("no config found in a bare temp tree", loadDevcontainerJson(join(bare, "a", "b")).path === null);
+		} finally {
+			rmSync(bare, { recursive: true, force: true });
+		}
+
+		// Unparseable config reports the path but no config. A fresh dir:
+		// the named configs above would shadow a bare file in `child`.
+		const badDir = mkdtempSync(join(tmpdir(), "dc-bad-"));
+		try {
+			writeFileSync(join(badDir, "devcontainer.json"), "{ this is not json");
+			const bad = loadDevcontainerJson(badDir);
+			checkTrue("broken config has path", bad.path === join(badDir, "devcontainer.json"));
+			checkTrue("broken config has null config", bad.config === null);
+		} finally {
+			rmSync(badDir, { recursive: true, force: true });
+		}
 	} finally {
 		rmSync(tmp, { recursive: true, force: true });
 	}
@@ -143,6 +180,8 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		projectCwd,
 		canonicalCwd: projectCwd,
 		configRoot: projectCwd,
+		configPath: join(projectCwd, ".devcontainer", "devcontainer.json"),
+		configDefaulted: true,
 		containerName: "pi-devcontainer-proj",
 		workspaceFolder: projectCwd,
 		useCli: true,
@@ -1010,9 +1049,11 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	// extraArgs goes to the CLI verbatim rather than being modelled, so
 	// --no-cache works without a flag here.
 	const bringUp = source.slice(source.indexOf("const bringUp = async"), source.indexOf("const rebuildTool"));
+	// --config precedes extraArgs: the config file location must win over
+	// whatever the caller appends.
 	checkTrue(
 		"extraArgs are appended to the up arguments",
-		/\["up", "--workspace-folder", wsFolder, \.\.\.extraArgs\]/.test(bringUp),
+		/upArgs\.push\("--config", cfg\.configPath\);\s*upArgs\.push\(\.\.\.extraArgs\);/.test(bringUp),
 		"upArgs",
 	);
 	checkTrue("bringUp accepts the extra arguments", bringUp.includes("extraArgs: string[] = []"), "signature");

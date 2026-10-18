@@ -384,18 +384,21 @@ export default function (pi: ExtensionAPI) {
 		setToolActive(false);
 
 		if (pi.getFlag("no-devcontainer") === true) return;
-		const { config, path, root } = loadDevcontainerJson(projectDir);
+		const { config, path, root, configDir, multi } = loadDevcontainerJson(projectDir);
 		if (!path) return; // no devcontainer in this project
 		if (!config) {
 			notify(`Devcontainer file exists but could not be parsed: ${path}`, "error");
 			return;
 		}
+		if (multi) notify(`Using devcontainer config ${multi} from ${path}`, "info");
+		if (root && root !== projectDir) notify(`Using the devcontainer config found above the project: ${path}`, "info");
 
 		const image = typeof config.image === "string" ? config.image : undefined;
 		const configRoot = root ?? projectDir;
 		// The `workspaceFolder` config field (when set) names the folder to
-		// bind-mount; a relative value is resolved against the config's
-		// directory. Otherwise the config's directory is the workspace root.
+		// bind-mount; a relative value is resolved against the directory that
+		// contains the config. Otherwise the searched directory is the
+		// workspace root.
 		// Honored by the DOCKER FALLBACK only: the devcontainer CLI resolves
 		// its config at <folder>/.devcontainer/ and never searches upward, so
 		// CLI mode must be pointed at the config root instead (see
@@ -403,7 +406,7 @@ export default function (pi: ExtensionAPI) {
 		let declaredWorkspaceFolder: string;
 		if (typeof config.workspaceFolder === "string" && config.workspaceFolder !== "") {
 			const rawWf = config.workspaceFolder;
-			declaredWorkspaceFolder = isAbsolute(rawWf) ? rawWf : resolve(configRoot, rawWf);
+			declaredWorkspaceFolder = isAbsolute(rawWf) ? rawWf : resolve(configDir ?? configRoot, rawWf);
 			try {
 				declaredWorkspaceFolder = realpathSync(declaredWorkspaceFolder);
 			} catch {
@@ -419,10 +422,32 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			// fall back to the raw cwd
 		}
+		// The config root is canonicalized too: `devcontainer up` is pointed at
+		// it, and a symlinked parent would be mounted from a path the kernel
+		// sees differently than the CLI's label records (see ports.ts).
+		let canonicalRoot = configRoot;
+		try {
+			canonicalRoot = realpathSync(configRoot);
+		} catch {
+			// fall back to the resolved root
+		}
+		// The CLI finds the config on its own ONLY at
+		// <workspace-folder>/.devcontainer/devcontainer.json; every other
+		// location (named config, legacy bare file, a config above the
+		// project) is passed as an explicit --config.
+		let canonicalConfigPath = path;
+		try {
+			canonicalConfigPath = realpathSync(path);
+		} catch {
+			// fall back to the raw path
+		}
+		const configDefaulted = canonicalConfigPath === join(canonicalRoot, ".devcontainer", "devcontainer.json");
 		cfg = {
 			projectCwd: projectDir,
 			canonicalCwd,
-			configRoot: canonicalCwd,
+			configRoot: canonicalRoot,
+			configPath: canonicalConfigPath,
+			configDefaulted,
 			// Include a short hash of the canonical path: two projects sharing a
 			// basename (e.g. ~/work/api and ~/oss/api) would otherwise collide
 			// on one container name, and `ensureDockerContainer` would happily
@@ -475,7 +500,9 @@ export default function (pi: ExtensionAPI) {
 			// Anything the rebuild tool was given is appended to `up` verbatim,
 			// so `--no-cache` reaches the CLI without this extension having to
 			// model a flag set that grows with every CLI release.
-			const upArgs = ["up", "--workspace-folder", wsFolder, ...extraArgs];
+			const upArgs = ["up", "--workspace-folder", wsFolder];
+			if (!cfg.configDefaulted) upArgs.push("--config", cfg.configPath);
+			upArgs.push(...extraArgs);
 			if (override.features && Object.keys(override.features).length > 0) {
 				upArgs.push("--additional-features", JSON.stringify(override.features));
 			}
@@ -915,12 +942,11 @@ export default function (pi: ExtensionAPI) {
 		renderShell: "default",
 		...createDevcontainerRenderers(),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const projectDir = sessionCwd;
-			if (!projectDir) throw new Error("no session directory to rebuild; this tool only works inside a project session");
-			const { path } = loadDevcontainerJson(projectDir);
+			if (!sessionCwd) throw new Error("no session directory to rebuild; this tool only works inside a project session");
+			const { path } = loadDevcontainerJson(sessionCwd);
 			if (!path) {
 				throw new Error(
-					`no .devcontainer/devcontainer.json in ${projectDir}; create one with \`${CREATE_TOOL_NAME}\` first — there is nothing to rebuild`,
+					`no devcontainer.json in ${sessionCwd} (searched .devcontainer/, its subdirectories and parent directories); create one with \`${CREATE_TOOL_NAME}\` first — there is nothing to rebuild`,
 				);
 			}
 			if (bringUpInFlight) {
@@ -971,7 +997,7 @@ export default function (pi: ExtensionAPI) {
 					details: tail.counts(),
 				});
 			}
-			await bringUp(projectDir, extraArgs);
+			await bringUp(sessionCwd, extraArgs);
 			await ensureReady(cfg as DevcontainerConfig, {
 				isEnabled: () => active,
 				onProgress: (line) => {
