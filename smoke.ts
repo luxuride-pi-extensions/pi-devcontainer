@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { asJsonObject, parseJsonc } from "./jsonc.js";
 import { alreadyInContainer, loadDevcontainerJson } from "./config.js";
 import { provisionContainer } from "./provision.js";
-import { resolveToolCwd, runInContainer, settleBringUp } from "./run-in-container.js";
+import { containerAlive, resolveToolCwd, runInContainer, settleBringUp } from "./run-in-container.js";
 import { BringUpLog, describePhase, startProgressWidget } from "./progress.js";
 import { shq } from "./exec.js";
 import { DOCKER_IN_DOCKER_FEATURE, DOCKER_OUTSIDE_OF_DOCKER_FEATURE, BASE_IMAGE, BASE_IMAGES, DOTNET_FEATURE, NODE_FEATURE, STACK_FEATURES, baseImageFor, describeDockerAccess, featureFor, projectProfile, scaffold, stackIds } from "./scaffold.js";
@@ -254,6 +254,73 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		rmSync(bin, { recursive: true, force: true });
 		rmSync(projectCwd, { recursive: true, force: true });
 	}
+}
+
+// --- container liveness ------------------------------------------------
+// A container that dies AFTER its bring-up settled (docker restart, docker
+// rm, OOM) sails through a spent pendingUp and fails at exec with "no such
+// container". containerAlive is what the run tool probes before deciding to
+// re-up, so a false "alive" here would make the recovery a no-op.
+{
+	const bin = mkdtempSync(join(tmpdir(), "dc-alive-bin-"));
+	const fake = join(bin, "docker");
+	writeFileSync(fake, "#!/bin/sh\necho running\n");
+	chmodSync(fake, 0o755);
+	const prevPath = process.env.PATH;
+	process.env.PATH = `${bin}:${prevPath ?? ""}`;
+	try {
+		// CLI mode: the container is found by its label, not by a name this
+		// extension invented — the fake docker answers `docker ps` with the
+		// CLI's own name for it, then `docker inspect` with its state.
+		writeFileSync(fake, '#!/bin/sh\n[ "$1" = "ps" ] && { echo vhn-proj; exit 0; }\necho running\n');
+		const cliCfg = {
+			projectCwd: "/p",
+			configRoot: "/p",
+			containerName: "pi-devcontainer-proj",
+			useCli: true,
+		} as unknown as Parameters<typeof containerAlive>[0];
+		const up = await containerAlive(cliCfg);
+		checkTrue("a running CLI container is alive", up.alive);
+		check("the CLI container's name is the label match", up.containerName, "vhn-proj");
+
+		// Docker fallback: the container is the one this extension created.
+		const dockerCfg = {
+			projectCwd: "/p",
+			configRoot: "/p",
+			containerName: "pi-devcontainer-proj",
+			useCli: false,
+		} as unknown as Parameters<typeof containerAlive>[0];
+		const running = await containerAlive(dockerCfg);
+		checkTrue("a running docker-fallback container is alive", running.alive);
+		check("its name is the config's", running.containerName, "pi-devcontainer-proj");
+
+		// A docker that errors (daemon gone) is dead, not a crash.
+		writeFileSync(fake, "#!/bin/sh\necho Cannot connect to the Docker daemon >&2\nexit 1\n");
+		const daemonDown = await containerAlive(dockerCfg);
+		checkTrue("an unreachable docker reports not alive", !daemonDown.alive);
+		checkTrue("an unreachable docker still names the container", daemonDown.containerName === "pi-devcontainer-proj");
+
+		// A container that exists but is not running (docker rm -s / OOM kill).
+		writeFileSync(fake, '#!/bin/sh\n[ "$1" = "inspect" ] && { echo exited; exit 0; }\necho proj\n');
+		const stopped = await containerAlive(cliCfg);
+		checkTrue("an exited container is not alive", !stopped.alive);
+	} finally {
+		process.env.PATH = prevPath;
+		rmSync(bin, { recursive: true, force: true });
+	}
+
+	// Source shape: the recovery fires only on exec's container errors and
+	// re-runs bringUp once, with the settle awaiter re-reading the fresh cfg.
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	checkTrue("the re-up probe exists", source.includes("containerAlive(before)"), "probe");
+	checkTrue(
+		"the recovery matches both exec failure spellings",
+		/no such container\|is not running/i.test(source),
+		"match",
+	);
+	checkTrue("a live container never re-ups", source.includes("if (alive.alive) return false;"), "no re-up");
+	checkTrue("a bring-up in flight never re-ups", source.includes("if (bringUpInFlight) return false;"), "in-flight");
+	checkTrue("the re-up re-reads the fresh config", source.includes("if (!fresh || fresh === before"), "fresh");
 }
 
 // --- stdin is piped, not dropped ---------------------------------------
