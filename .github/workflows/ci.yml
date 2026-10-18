@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    # master is the integration branch; the list is explicit rather than
+    # `[master]` so a new long-lived branch is checked from the commit that
+    # creates it, not silently uncovered (see pi-blender's ci.yml for the
+    # full argument).
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: typecheck and smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      # --legacy-peer-deps is not optional: package.json declares
+      # peerDependencies on @earendil-works packages that are never published
+      # to npm, so plain `npm ci` fails with 404.
+      - name: install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: typecheck
+        run: npm run typecheck
+
+      # The smoke suite compiles to .smoke-build/ and runs there; it asserts
+      # both pure logic and generated command strings, and needs no docker or
+      # devcontainer CLI (container-exec tests run against a fake on PATH).
+      - name: smoke tests
+        run: npm test
+
+      # A release tarball that drops a file pi's module loader needs fails on
+      # the user's machine only, where the working tree hides it. Check the
+      # allowlist and the import graph at the same place every push lands.
+      - name: the package ships what it imports
+        run: |
+          set -euo pipefail
+          npm pack --dry-run --json > pack.json
+          node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const pkg = require("./package.json");
+            const packed = JSON.parse(fs.readFileSync("pack.json", "utf8"));
+            const p = Array.isArray(packed) ? packed[0] : packed[pkg.name];
+            if (!p) throw new Error(`npm pack --json returned no entry for ${pkg.name}`);
+            const paths = new Set(p.files.map((f) => f.path));
+            const missing = [];
+            for (const e of pkg.pi.extensions) {
+              const rel = e.replace(/^\.\//, "");
+              if (!paths.has(rel)) missing.push(`extension entry ${rel}`);
+            }
+            for (const bad of ["test/", ".github/", "smoke.ts"]) {
+              const shipped = [...paths].filter((x) => x === bad || x.startsWith(bad));
+              if (shipped.length) missing.push(`${shipped.length} file(s) matching ${bad}, e.g. ${shipped[0]}`);
+            }
+            const resolveIn = (from, spec) => {
+              const base = path.posix.normalize(path.posix.join(path.posix.dirname(from), spec));
+              const cands = [base];
+              if (/\.(js|mjs|cjs)$/.test(base)) {
+                const stem = base.replace(/\.(js|mjs|cjs)$/, "");
+                cands.push(stem + ".ts", stem + ".tsx", stem + ".js");
+              } else {
+                cands.push(base + ".ts", base + ".js", path.posix.join(base, "index.ts"));
+              }
+              return cands;
+            };
+            const checkImports = (file) => {
+              const src = fs.readFileSync(file, "utf8");
+              for (const m of src.matchAll(/from\s+"(\.[^"]+)"/g)) {
+                const spec = m[1];
+                if (resolveIn(file, spec).some((c) => paths.has(c))) continue;
+                missing.push(`${file}: "${spec}" resolves to nothing in the tarball`);
+              }
+            };
+            for (const e of pkg.pi.extensions) checkImports(e.replace(/^\.\//, ""));
+            if (missing.length) {
+              console.error(missing.join("\n"));
+              process.exit(1);
+            }
+            console.log(`ok ${p.files.length} files, every entry and relative import resolvable`);
+          '

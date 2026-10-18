@@ -1,0 +1,153 @@
+name: release
+
+# pi loads this extension as TypeScript straight from a clone of this repo,
+# so a tag IS the artifact; the tarball is attached for offline installs.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build and attach the tarball
+    runs-on: ubuntu-latest
+    steps:
+      - name: resolve the tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          case "$tag" in
+            v*) ;;
+            *) echo "::error::tag must start with v, got '$tag'"; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      # A release cut from anything but the integration branch's tip would
+      # ship a tree that branch has already moved past; fail loudly instead.
+      - name: the tag is on master
+        run: |
+          set -euo pipefail
+          tag_rev="$(git rev-parse HEAD)"
+          head_rev="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
+          if ! git merge-base --is-ancestor "$tag_rev" "$head_rev"; then
+            echo "::error::tag ${{ steps.tag.outputs.tag }} is not an ancestor of origin/master"
+            exit 1
+          fi
+
+      - name: the tag matches package.json
+        run: |
+          set -euo pipefail
+          version="$(node -p 'require("./package.json").version')"
+          if [ "${{ steps.tag.outputs.tag }}" != "v$version" ]; then
+            echo "::error::tag v$version mismatch: tag is ${{ steps.tag.outputs.tag }}, package.json is $version. Bump the version and commit it BEFORE tagging."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: smoke tests
+        run: npm test
+
+      - name: pack
+        run: |
+          set -euo pipefail
+          npm pack
+          tarball="$(ls *.tgz)"
+          echo "tarball=$tarball" >> "$GITHUB_ENV"
+          # The files allowlist in package.json must be complete, or the
+          # clone-vs-tarball difference only shows up on the user's machine.
+          tar -tzf "$tarball" | grep -v "^package/$" | sort > packed.txt
+          node -e '
+            const fs = require("node:fs");
+            const pkg = require("./package.json");
+            const wanted = [...pkg.files, "package.json", "README.md"].sort();
+            const packed = fs.readFileSync("packed.txt", "utf8").trim().split("\n").sort();
+            const missing = wanted.filter((f) => !packed.includes(`package/${f}`));
+            const extra = packed.filter((f) => !wanted.includes(f.replace(/^package\//, "")));
+            if (missing.length || extra.length) {
+              if (missing.length) console.error("missing from tarball:\n" + missing.join("\n"));
+              if (extra.length) console.error("shipped but not allowlisted:\n" + extra.join("\n"));
+              process.exit(1);
+            }
+            for (const e of pkg.pi.extensions) if (!packed.includes(`package/${e.replace(/^\.\//, "")}`)) {
+              console.error(`extension entry ${e} is not in the tarball`);
+              process.exit(1);
+            }
+            console.log(`ok ${packed.length} files, pi.extensions entries present`);
+          '
+
+      - name: release notes
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          previous="$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || true)"
+          {
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "pi install git:github.com/luxuride-pi-extensions/pi-devcontainer@$tag"
+            echo '```'
+            echo
+            echo "## What changed"
+            echo
+            if [ -n "$previous" ]; then
+              git log --format="- %s" "$previous..$tag"
+            else
+              git log --format="- %s" "$tag"
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::release $tag already exists"
+            exit 1
+          fi
+          gh release create "$tag" \
+            --verify-tag \
+            --title "pi-devcontainer $tag" \
+            --notes-file release-notes.md \
+            "$tarball"
+
+      - name: the release carries the tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "${{ steps.tag.outputs.tag }}" --json assets --jq '.assets[].name')"
+          echo "$assets"
+          echo "$assets" | grep -q "${{ env.tarball }}" || {
+            echo "::error::tarball missing from the release"
+            exit 1
+          }

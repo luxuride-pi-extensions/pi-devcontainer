@@ -2,9 +2,35 @@
 	"name": "pi-devcontainer",
 	"version": "0.1.0",
 	"description": "pi extension: run project commands inside the project's devcontainer",
+	"keywords": [
+		"pi-extension",
+		"devcontainer",
+		"docker"
+	],
 	"private": true,
 	"type": "module",
 	"license": "MIT",
+	"files": [
+		"index.ts",
+		"config.ts",
+		"docker.ts",
+		"exec.ts",
+		"features-index.ts",
+		"jsonc.ts",
+		"override.ts",
+		"ports.ts",
+		"progress.ts",
+		"provision.ts",
+		"render.ts",
+		"run-in-container.ts",
+		"scaffold.ts",
+		"types.ts"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
 	"scripts": {
 		"typecheck": "tsc --noEmit",
 		"test": "tsc --noEmit false --outDir ./.smoke-build && node ./.smoke-build/smoke.js; code=$?; rm -rf ./.smoke-build; exit $code"
