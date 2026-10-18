@@ -47,13 +47,13 @@ export interface SettleOptions {
  * NORMAL failure signal (the bring-up closure already notified the user), so
  * it is swallowed here and re-thrown as a single readable message.
  *
- * The wait is BOUNDED. Bring-up on a first run spends its time pulling images
- * and building feature layers, which can be many minutes; an unbounded await
- * produces a blank tool row for all of it, and a blank row reads as a hang
- * rather than as progress. So progress lines are streamed out while waiting,
- * and a wait that runs past its budget ends with a message naming what is
- * happening and how to keep waiting — an informed decision instead of a
- * stuck call.
+ * The wait is BOUNDED ONLY WHEN ASKED. Bring-up on a first run spends its
+ * time pulling images and building feature layers, which can be many minutes;
+ * with progress lines streaming out while waiting, an unbounded await is what
+ * the caller wants — the build does not fail the call. A caller that passes a
+ * waitBudgetSeconds cap gets the old behavior instead: a wait that runs past
+ * the cap ends with a message naming what is happening and how to keep
+ * waiting — an informed decision instead of a stuck call.
  */
 export async function settleBringUp(cfg: DevcontainerConfig, opts: SettleOptions): Promise<void> {
 	if (!cfg.pendingUp) return;
@@ -66,6 +66,8 @@ export async function settleBringUp(cfg: DevcontainerConfig, opts: SettleOptions
 	 */
 	const stopWidget = startProgressWidget(opts.ui, log ?? EMPTY_LOG, cfg.projectCwd);
 	// A timer that is never cleared would hold the process open at shutdown.
+	// No budget means no cap: the wait ends when bring-up settles or the
+	// caller's signal aborts.
 	const budget = opts.waitBudgetSeconds !== undefined && opts.waitBudgetSeconds > 0 ? opts.waitBudgetSeconds * 1000 : 0;
 	let timeoutHandle: NodeJS.Timeout | undefined;
 	// The reason bring-up failed is the single most useful thing the waiting
@@ -114,7 +116,7 @@ export async function settleBringUp(cfg: DevcontainerConfig, opts: SettleOptions
 				[
 					`the devcontainer is still being created after ${Math.round(budget / 1000)}s — a first-run image pull and feature build, not a failure.`,
 					report.length > 0 ? ["last bring-up output:", ...report.map((l) => `  ${l}`)].join("\n") : "",
-					"Call the command again with a larger `waitForContainer` (e.g. 900) to keep waiting, or watch it yourself on the host with `devcontainer up --workspace-folder <project>`.",
+					"Call the command again with a larger `waitForContainer` cap (e.g. 900) to keep waiting, or watch it yourself on the host with `devcontainer up --workspace-folder <project>`. Without a cap the call would have kept waiting until the container was up.",
 				]
 					.filter(Boolean)
 					.join("\n"),

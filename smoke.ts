@@ -300,10 +300,11 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	checkTrue("settleBringUp reports the bring-up reason", msg.includes("up exited 1"), msg);
 }
 
-// --- a still-running bring-up is bounded, streamed, and re-waitable ----
+// --- a still-running bring-up: streamed, re-waitable, capped on request ---
 // The blank-row hang this fixes: an unbounded await over a multi-minute image
-// pull. The wait must return, must have shown the pull output while waiting,
-// and must not claim the container is ready.
+// pull. The default has no cap — the call waits until bring-up settles, with
+// the pull output streaming out while waiting — and a caller that passes a
+// waitBudgetSeconds cap gets the bounded behavior back instead.
 {
 	const log = new BringUpLog();
 	log.append("Pulling mcr.microsoft.com/devcontainers/dotnet:8.0\n");
@@ -327,6 +328,51 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	}
 	checkTrue("a pending bring-up does not hang the call", !never);
 	checkTrue("the wait is bounded by its budget", Date.now() - started < 5000, Date.now() - started);
+	checkTrue("the report says it is still running, not failed", msg.includes("still being created"), msg);
+	checkTrue("the report is not a failure verdict", !msg.includes("bring-up failed"), msg);
+	checkTrue("the report says how to keep waiting", msg.includes("waitForContainer"), msg);
+
+	// No budget means no cap: the call waits for the bring-up itself. It must
+	// still be abortable — a cancel has to end the wait even without a cap —
+	// and the pull output must reach onProgress while it waits.
+	{
+		const abort = new AbortController();
+		const seenUnbounded: string[] = [];
+		let abortedMsg = "";
+		const unbounded = settleBringUp(cfg, {
+			isEnabled: () => true,
+			onProgress: (l) => seenUnbounded.push(l),
+			signal: abort.signal,
+		});
+		setTimeout(() => abort.abort(), 150);
+		try {
+			await unbounded;
+		} catch (err) {
+			abortedMsg = err instanceof Error ? err.message : String(err);
+		}
+		checkTrue("an uncapped wait ends when the caller aborts", abortedMsg.includes("aborted"), abortedMsg);
+		checkTrue("the uncapped wait streams progress while waiting", seenUnbounded.length > 0, seenUnbounded.length);
+	}
+
+	// An uncapped wait over a bring-up that DOES settle resolves rather than
+	// reporting "still being created" — the cap is the only thing that can
+	// cut the wait short.
+	{
+		const settling = {
+			pendingUp: new Promise<void>((res) => setTimeout(res, 100)),
+			bringUpLog: log,
+			projectCwd: "/proj",
+		} as unknown as DevcontainerConfig;
+		let settled = false;
+		let err2 = "";
+		try {
+			await settleBringUp(settling, { isEnabled: () => true });
+			settled = true;
+		} catch (e) {
+			err2 = e instanceof Error ? e.message : String(e);
+		}
+		checkTrue("an uncapped wait over a settling bring-up resolves", settled, err2);
+	}
 	checkTrue("the report says it is still running, not failed", msg.includes("still being created"), msg);
 	checkTrue("the report is not a failure verdict", !msg.includes("bring-up failed"), msg);
 	checkTrue("the report says how to keep waiting", msg.includes("waitForContainer"), msg);

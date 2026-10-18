@@ -81,13 +81,6 @@ const TOOL_NAME = "devcontainer";
 const CREATE_TOOL_NAME = "create_devcontainer";
 const REBUILD_TOOL_NAME = "devcontainer_rebuild";
 const DEFAULT_TIMEOUT = 120;
-/**
- * How long one call waits for a still-running bring-up before reporting that
- * it is still running. Long enough for a warm start, short enough that a cold
- * image pull comes back as progress plus an offer to keep waiting rather than
- * as a silent tool row.
- */
-const DEFAULT_WAIT_FOR_CONTAINER = 90;
 
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag("no-devcontainer", {
@@ -191,9 +184,9 @@ export default function (pi: ExtensionAPI) {
 			"- `command` (required): the shell command, run with `bash -c` (non-login: profile scripts do not run).",
 			"- `cwd` (optional): directory to run in, relative to the workspace root inside the container, or an absolute CONTAINER path. Omit it for the workspace root. A host path does not exist here; the result reports the host path of the directory actually used so `read`/`edit`/`write` can target the same files.",
 			"- `stdin` (optional): text piped to the command's standard input. Use it for heredocs and piped input instead of shell redirection to a file.",
-			"- `timeout` (optional): seconds before the command is killed (default 120).",
+			"- `timeout` (optional): seconds before the command is killed (default 120). The timer starts only once the container is up, so a first-run image pull or feature build never eats the command's time budget.",
 			"- `tail` (optional): keep only the LAST N lines of output, for commands whose interesting part is at the end (`npm test`, `cargo build`, a failing build). Omit it to keep the default limit. Use it when the output is mostly noise — you can always re-run with a bigger `tail` or read a log file the command wrote.",
-			"- `waitForContainer` (optional): seconds to wait when the container is still being created by a first-run image pull or feature build (default 90). Pull output is streamed while it waits; on giving up the tool says the build is STILL RUNNING and tells you to call again with a larger value. That is not a failure — retry with a bigger number instead of reporting a broken container."
+			"- `waitForContainer` (optional): cap in seconds on the wait for a still-building container. By default the call waits until the container is up — pull/build output streams into the tool row while it waits — so a long first build does not fail the call. Pass a cap only if you want the call to come back early while the build keeps running in the background."
 		].join("\n"),
 		promptSnippet: "Run a shell command inside this project's devcontainer",
 		promptGuidelines: [
@@ -209,7 +202,7 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			stdin: Type.Optional(Type.String({ description: "Text piped to the command's stdin" })),
-			timeout: Type.Optional(Type.Number({ description: "Seconds before the command is killed (default 120)" })),
+			timeout: Type.Optional(Type.Number({ description: "Seconds before the command is killed (default 120). The timer starts only once the container is up, so a first-run image pull or feature build never eats the command's time budget." })),
 			tail: Type.Optional(
 				Type.Number({
 					description:
@@ -219,7 +212,7 @@ export default function (pi: ExtensionAPI) {
 			waitForContainer: Type.Optional(
 				Type.Number({
 					description:
-						"Seconds to wait for a first-run image pull / feature build before reporting that it is still running (default 90).",
+						"Cap in seconds on the wait for a still-building container. Default: wait until the container is up; the build never fails the call.",
 				}),
 			),
 		}),
@@ -288,10 +281,7 @@ export default function (pi: ExtensionAPI) {
 				// The status bar is the only channel the user has during the
 				// wait, since the tool row cannot render before the first tick.
 				ui: ctx?.ui,
-				waitBudgetSeconds:
-					params.waitForContainer === undefined || params.waitForContainer <= 0
-						? DEFAULT_WAIT_FOR_CONTAINER
-						: params.waitForContainer,
+				waitBudgetSeconds: params.waitForContainer,
 			});
 			// The pull/build log leaves the row once the command's own output
 			// starts, so the row shows the command rather than a mixture of two
@@ -904,7 +894,7 @@ export default function (pi: ExtensionAPI) {
 			"",
 			"Parameters:",
 			"- `extraArgs` (optional): arguments appended to `devcontainer up` verbatim, e.g. \"--no-cache\" or \"--remove-existing-container\". Omit it for a normal rebuild. Anything invalid is rejected by the CLI, with its own message.",
-			"- `waitForContainer` (optional): seconds to wait for the rebuild to finish before reporting that it is still running (default 90). It keeps running either way; call again with a larger number rather than treating that as a failure."
+			"- `waitForContainer` (optional): cap in seconds on the wait for the rebuild to finish. By default the call waits until the rebuild is done — pull/build output streams into the tool row while it waits. Pass a cap only if you want the call to come back early while the rebuild keeps running in the background."
 		].join("\n"),
 		promptSnippet: "Rebuild this project's devcontainer image from its config",
 		promptGuidelines: [
@@ -918,7 +908,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			waitForContainer: Type.Optional(
 				Type.Number({
-					description: "Seconds to wait for the rebuild before reporting that it is still running (default 90).",
+					description: "Cap in seconds on the wait for the rebuild. Default: wait until the rebuild is done.",
 				}),
 			),
 		}),
@@ -990,8 +980,7 @@ export default function (pi: ExtensionAPI) {
 				},
 				signal,
 				ui: ctx?.ui,
-				waitBudgetSeconds:
-					params.waitForContainer === undefined || params.waitForContainer <= 0 ? DEFAULT_WAIT_FOR_CONTAINER : params.waitForContainer,
+				waitBudgetSeconds: params.waitForContainer,
 			});
 			// The pull log leaves the row once the rebuild itself is done.
 			tail.reset();
