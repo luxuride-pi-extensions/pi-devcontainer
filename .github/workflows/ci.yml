@@ -8,9 +8,6 @@ on:
     # full argument).
     branches:
       - master
-      # Feature lanes: every branch the team opens is named feat/* so CI
-      # covers it from its first push, before any PR exists.
-      - "feat/**"
   pull_request:
   workflow_dispatch:
 
