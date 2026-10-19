@@ -1,6 +1,6 @@
 # pi-devcontainer
 
-Pi extension: run project commands inside the project's devcontainer.
+Pi extension: run project commands inside a project's devcontainer.
 
 `bash` stays on the host. This extension registers a `devcontainer` tool whose
 commands run INSIDE the container, so the two filesystems never silently swap
@@ -12,9 +12,9 @@ same files from the host side.
 
 | Tool | What it does |
 | --- | --- |
-| `devcontainer` | Run a shell command inside the container (`bash -c`, with `cwd`, `stdin`, `timeout`, `tail`, `waitForContainer`). |
-| `create_devcontainer` | Create or edit `.devcontainer/devcontainer.json`. First call with no arguments reports the detected stack, the available base images and the ~1440-feature catalog from containers.dev; later calls write the image/features picked. |
-| `devcontainer_rebuild` | Re-run `devcontainer up` in the background after editing anything the image is built from. |
+| `devcontainer` | Run a shell command inside the container (`bash -c`, with `cwd`, `stdin`, `timeout`, `tail`, `waitForContainer`). `project` targets another directory's container. |
+| `create_devcontainer` | Create or edit `.devcontainer/devcontainer.json`. First call with no arguments reports the detected stack, the available base images and the ~1440-feature catalog from containers.dev; later calls write the image/features picked. `project` targets another directory. |
+| `devcontainer_rebuild` | Re-run `devcontainer up` in the background after editing anything the image is built from. `project` targets another directory's config. |
 
 The run tool is registered at startup but stays INACTIVE until the container is
 actually up, so a project without a devcontainer sees no tool it cannot serve.
@@ -35,10 +35,24 @@ actually up, so a project without a devcontainer sees no tool it cannot serve.
   displaced; the run tool's result and `/devcontainer-ports` report the
   mapping, since `localhost:<container port>` is NOT the container's service.
 
+## Other projects
+
+A session anchored in one project can also work in a sibling checkout whose
+devcontainer is different. Pass the host directory as the tools' `project`
+parameter (absolute, or relative to the session directory) — relative paths
+resolve against the session directory. The first bring-up for that directory
+still has to happen once: either by starting a session there, or by calling
+`create_devcontainer` with `project` pointed at it. Afterwards `devcontainer`,
+`create_devcontainer` and `devcontainer_rebuild` all accept `project`, each
+project keeps its own container, config and port mappings, and the run tool
+reports the `project` it targeted. Omitting `project` keeps every tool
+anchored to the session's own project.
+
 ## Session commands
 
 - `/devcontainer` — watch what the bring-up is doing right now.
-- `/devcontainer-ports` — list the container ports published on the host.
+- `/devcontainer-ports` — list the container ports published on the host,
+  across every project this session brought up.
 
 ## Global override
 

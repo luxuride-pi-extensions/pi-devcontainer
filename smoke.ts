@@ -372,8 +372,8 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 		/no such container\|is not running/i.test(source),
 		"match",
 	);
-	checkTrue("a live container never re-ups", source.includes("if (alive.alive) return false;"), "no re-up");
-	checkTrue("a bring-up in flight never re-ups", source.includes("if (bringUpInFlight) return false;"), "in-flight");
+	checkTrue("a live container never re-ups", source.includes("if (alive.alive) return null;"), "no re-up");
+	checkTrue("a bring-up in flight never re-ups", source.includes("if (bringUpInFlight.has(root)) return null;"), "in-flight");
 	checkTrue("the re-up re-reads the fresh config", source.includes("if (!fresh || fresh === before"), "fresh");
 }
 
@@ -1137,7 +1137,7 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	// The doc comment already promises this; the promise is the reason.
 	checkTrue(
 		"the declaration says bring-up returns immediately",
-		/Bring-up itself stays in the BACKGROUND[\s\S]{0,200}awaiting cfg\.pendingUp/.test(source),
+		/Bring-up itself stays in the BACKGROUND[\s\S]{0,200}awaiting the project's own pendingUp/.test(source),
 		"doc comment",
 	);
 }
@@ -1174,13 +1174,13 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	// whatever the caller appends.
 	checkTrue(
 		"extraArgs are appended to the up arguments",
-		/upArgs\.push\("--config", cfg\.configPath\);\s*upArgs\.push\(\.\.\.extraArgs\);/.test(bringUp),
+		/upArgs\.push\("--config", c\.configPath\);\s*upArgs\.push\(\.\.\.extraArgs\);/.test(bringUp),
 		"upArgs",
 	);
 	checkTrue("bringUp accepts the extra arguments", bringUp.includes("extraArgs: string[] = []"), "signature");
 	// The refusal is the part that matters: two `up` processes against one
 	// container report each other's failures.
-	checkTrue("a rebuild refuses to stack on a running bring-up", source.includes("if (bringUpInFlight) {"), "bringUpInFlight");
+	checkTrue("a rebuild refuses to stack on a running bring-up", source.includes("if (bringUpInFlight.has(rebuildRoot)) {"), "bringUpInFlight");
 	checkTrue(
 		"the refusal explains why",
 		/a devcontainer bring-up is already running[\s\S]{0,200}Wait for it to finish/.test(source),
@@ -1303,7 +1303,7 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	// label rather than inspect the name it invented for its own container.
 	checkTrue("the CLI container is found by its label", portsSource.includes("devcontainer.local_folder"), "label");
 	// A relay must not outlive the session that bound host ports for it.
-	checkTrue("the forwarder is stopped at shutdown", source.includes("forwarder?.stop()"), "stop");
+	checkTrue("the forwarder is stopped at shutdown", source.includes("for (const f of forwarders.values()) f.stop();"), "stop");
 	// The container's own infrastructure is not published.
 	checkTrue("debug and daemon ports are skipped", portsSource.includes("SKIP_PORTS"), "SKIP_PORTS");
 }

@@ -89,22 +89,30 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
-	let cfg: DevcontainerConfig | null = null;
 	let shuttingDown = false;
-	// True from the moment bring-up starts until its promise settles. Separate
-	// from bringUpFinished because that one also reads true for a session that
-	// never brought anything up, and a rebuild must only refuse to stack on a
-	// bring-up that is actually running.
-	let bringUpInFlight = false;
+	// True per root from the moment its bring-up starts until its promise
+	// settles. A rebuild must only refuse to stack on a bring-up that is
+	// actually running, and an `up` for one project must not be mistaken for
+	// one covering a different container.
+	const bringUpInFlight = new Set<string>();
 	// The tool is registered unconditionally (pi requires registration before
-	// setActiveTools can name it) but kept INACTIVE until the container is
-	// known to be up. A project with no devcontainer, or one whose container
-	// failed to start, therefore never shows a tool it cannot serve.
+	// setActiveTools can name it) but kept INACTIVE until a container is
+	// actually up. A session where no project has a devcontainer — or whose
+	// container failed to start — therefore never shows tools it cannot serve.
 	let active = false;
 	let lastUi: ExtensionUIContext | null = null;
 	// The session's project directory, captured at session_start so the create
 	// tool can act on the same directory without a second `ctx` from pi.
 	let sessionCwd: string | null = null;
+	// Per-project state, keyed by the CANONICAL project directory. The run
+	// tool's `project` parameter selects which entry the call targets, so one
+	// session can drive several sibling projects' containers; the session's
+	// own project remains the default.
+	const byRoot = new Map<string, DevcontainerConfig>();
+	// Per-project forwarders, keyed like `byRoot`. A relay outliving the
+	// session that asked for it would keep host ports bound after the user
+	// has moved on, so every entry is stopped at shutdown.
+	const forwarders = new Map<string, PortForwarder>();
 	// Fetched once per session on the config tool's first call.
 	let catalogPromise: Promise<CatalogFeature[]> | null = null;
 	// Held outside the promise so a failure can be reported per call without
@@ -115,10 +123,23 @@ export default function (pi: ExtensionAPI) {
 		if (!shuttingDown) lastUi?.notify?.(msg, level ?? "info");
 	};
 
-	// The session's forwarder, stopped at shutdown. Kept module-scoped because
-	// a relay outliving the session that asked for it would keep host ports
-	// bound after the user has moved on.
-	let forwarder: PortForwarder | undefined;
+	// Map keys are canonical so a call passing `~/work/api` and one passing
+	// the realpath of the same directory land on the same entry.
+	const canonicalDir = (dir: string): string => {
+		try {
+			return realpathSync(dir);
+		} catch {
+			return resolve(dir);
+		}
+	};
+
+	// A container counts as ready once its bring-up has started AND the tool
+	// has not been deactivated (shutdown, a failed rebuild). A project whose
+	// bring-up is still streaming counts — the first call awaits it.
+	const isReady = (c: DevcontainerConfig): boolean => {
+		if (!active) return false;
+		return byRoot.get(canonicalDir(c.projectCwd)) === c;
+	};
 
 	/**
 	 * Publish container ports on the host as the container opens them, and
@@ -130,7 +151,7 @@ export default function (pi: ExtensionAPI) {
 	 * started inside the container, and the host port is not derivable from
 	 * the container port by design (see ports.ts).
 	 */
-	const startPortForwarder = async (c: DevcontainerConfig, say: (message: string, level?: "info" | "warning" | "error") => void): Promise<void> => {
+	const startPortForwarder = async (root: string, c: DevcontainerConfig, say: (message: string, level?: "info" | "warning" | "error") => void): Promise<void> => {
 		// The CLI names its own container; the name this extension invents is
 		// for the docker-fallback container only. Both modes are covered,
 		// because neither is the other's container.
@@ -144,8 +165,8 @@ export default function (pi: ExtensionAPI) {
 		});
 		await f.noteDeclaredPorts();
 		f.start();
-		forwarder?.stop();
-		forwarder = f;
+		forwarders.get(root)?.stop();
+		forwarders.set(root, f);
 	};
 
 	// Changing the active tool set is transcript-visible (pi appends it before
@@ -174,15 +195,16 @@ export default function (pi: ExtensionAPI) {
 		name: TOOL_NAME,
 		label: "Devcontainer",
 		description: [
-			"Run a shell command INSIDE this project's devcontainer, using the same toolchain, user and filesystem the container has.",
+			"Run a shell command INSIDE a project's devcontainer, using the same toolchain, user and filesystem the container has.",
 			"",
 			"`bash` runs on the HOST. This tool runs in the CONTAINER. The two see different filesystems, so use this tool for anything that must be built, tested, installed or run by the container's toolchain (compilers, language runtimes, package managers, project commands).",
 			"",
-			"If this project has no devcontainer yet, create one with `create_devcontainer` first (call it with no arguments to see the available base images and features).",
+			"If the project has no devcontainer yet, create one with `create_devcontainer` first (call it with no arguments to see the available base images and features).",
 			"",
 			"Parameters:",
 			"- `command` (required): the shell command, run with `bash -c` (non-login: profile scripts do not run).",
 			"- `cwd` (optional): directory to run in, relative to the workspace root inside the container, or an absolute CONTAINER path. Omit it for the workspace root. A host path does not exist here; the result reports the host path of the directory actually used so `read`/`edit`/`write` can target the same files.",
+			"- `project` (optional): HOST directory of the project whose container to target, when it differs from the session's own project — e.g. a sibling checkout. The project must already have a devcontainer brought up in this session. Omit it for this session's project.",
 			"- `stdin` (optional): text piped to the command's standard input. Use it for heredocs and piped input instead of shell redirection to a file.",
 			"- `timeout` (optional): seconds before the command is killed (default 120). The timer starts only once the container is up, so a first-run image pull or feature build never eats the command's time budget.",
 			"- `tail` (optional): keep only the LAST N lines of output, for commands whose interesting part is at the end (`npm test`, `cargo build`, a failing build). Omit it to keep the default limit. Use it when the output is mostly noise — you can always re-run with a bigger `tail` or read a log file the command wrote.",
@@ -199,6 +221,12 @@ export default function (pi: ExtensionAPI) {
 				Type.String({
 					description:
 						"Directory relative to the container workspace root, or an absolute container path. Defaults to the workspace root.",
+				}),
+			),
+			project: Type.Optional(
+				Type.String({
+					description:
+						"Host directory of the project whose container to target when it differs from the session's own project (e.g. a sibling checkout). Must already have a devcontainer brought up in this session. Defaults to the session's project.",
 				}),
 			),
 			stdin: Type.Optional(Type.String({ description: "Text piped to the command's stdin" })),
@@ -219,10 +247,15 @@ export default function (pi: ExtensionAPI) {
 		renderShell: "default",
 		...createDevcontainerRenderers(),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const current = cfg;
-			if (!active || !current) {
+			const targetKey = params.project === undefined
+				? (sessionCwd ? canonicalDir(sessionCwd) : null)
+				: canonicalDir(isAbsolute(params.project) ? params.project : resolve(sessionCwd ?? process.cwd(), params.project));
+			const current = targetKey !== null ? byRoot.get(targetKey) ?? null : null;
+			if (!current) {
 				throw new Error(
-					"this project has no devcontainer; create one with `create_devcontainer`, or run this command with `bash` on the host",
+					params.project === undefined
+						? "this project has no devcontainer; create one with `create_devcontainer`, or run this command with `bash` on the host"
+						: `no devcontainer has been brought up for ${params.project} in this session; bring one up first (a session_start in that directory, or create_devcontainer targeting it)`,
 				);
 			}
 			// The output tail and the row's first update are set up BEFORE the bring-up
@@ -269,7 +302,7 @@ export default function (pi: ExtensionAPI) {
 				}, delay);
 			};
 			await ensureReady(current, {
-				isEnabled: () => active,
+				isEnabled: () => isReady(current),
 				onProgress: (line) => {
 					tail.append(line);
 					schedule();
@@ -306,9 +339,9 @@ export default function (pi: ExtensionAPI) {
 				// A container that died between bring-up and this call fails at
 				// exec with "no such container"; one re-up and the command runs
 				// against the fresh container instead of surfacing the raw error.
-				const recovered = await reUpAfterDeath(err, async (fresh) => {
+				const recovered = await reUpAfterDeath(err, current, async (fresh) => {
 					await ensureReady(fresh, {
-						isEnabled: () => active,
+						isEnabled: () => isReady(fresh),
 						onProgress: (line) => {
 							tail.append(line);
 							schedule();
@@ -322,7 +355,7 @@ export default function (pi: ExtensionAPI) {
 				const tailBefore = pending;
 				tail.reset();
 				const retried = await runInContainer(
-					cfg as DevcontainerConfig,
+					recovered,
 					{ ...params, timeout },
 					(chunk) => {
 						tail.append(chunk.toString());
@@ -351,7 +384,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const truncated = truncateTail(result.output, params.tail === undefined ? undefined : { maxLines: params.tail });
-			const forwardPorts = forwarder?.list() ?? [];
+			const forwardPorts = targetKey !== null ? forwarders.get(targetKey)?.list() ?? [] : [];
 			const header = [
 				`container cwd: ${result.containerCwd}`,
 				`host cwd: ${result.hostCwd}`,
@@ -409,25 +442,26 @@ export default function (pi: ExtensionAPI) {
 	 * once per call here, which is what makes scaffolding mid-session work.
 	 * Bring-up itself stays in the BACKGROUND (a first-run image pull can take
 	 * many minutes and must not block a tool call either), with the run
-	 * tool's first call awaiting cfg.pendingUp.
+	 * tool's first call awaiting the project's own pendingUp.
 	 */
 	const bringUp = async (projectDir: string, extraArgs: string[] = []) => {
-		cfg = null;
-		bringUpInFlight = false;
+		const root = canonicalDir(projectDir);
+		byRoot.delete(root);
+		bringUpInFlight.delete(root);
 		setToolActive(false);
 
 		if (pi.getFlag("no-devcontainer") === true) return;
-		const { config, path, root, configDir, multi } = loadDevcontainerJson(projectDir);
+		const { config, path, root: foundRoot, configDir, multi } = loadDevcontainerJson(projectDir);
 		if (!path) return; // no devcontainer in this project
 		if (!config) {
 			notify(`Devcontainer file exists but could not be parsed: ${path}`, "error");
 			return;
 		}
 		if (multi) notify(`Using devcontainer config ${multi} from ${path}`, "info");
-		if (root && root !== projectDir) notify(`Using the devcontainer config found above the project: ${path}`, "info");
+		if (foundRoot && foundRoot !== projectDir) notify(`Using the devcontainer config found above the project: ${path}`, "info");
 
 		const image = typeof config.image === "string" ? config.image : undefined;
-		const configRoot = root ?? projectDir;
+		const configRoot = foundRoot ?? projectDir;
 		// The `workspaceFolder` config field (when set) names the folder to
 		// bind-mount; a relative value is resolved against the directory that
 		// contains the config. Otherwise the searched directory is the
@@ -475,7 +509,7 @@ export default function (pi: ExtensionAPI) {
 			// fall back to the raw path
 		}
 		const configDefaulted = canonicalConfigPath === join(canonicalRoot, ".devcontainer", "devcontainer.json");
-		cfg = {
+		const c: DevcontainerConfig = {
 			projectCwd: projectDir,
 			canonicalCwd,
 			configRoot: canonicalRoot,
@@ -498,7 +532,6 @@ export default function (pi: ExtensionAPI) {
 				"devcontainer.json uses build/dockerCompose and the devcontainer CLI is not installed; the devcontainer tool stays unavailable",
 				"warning",
 			);
-			cfg = null;
 			return;
 		}
 
@@ -514,7 +547,7 @@ export default function (pi: ExtensionAPI) {
 		// Loaded once and shared by both execution modes.
 		const override = loadGlobalOverride();
 
-		if (cfg.useCli) {
+		if (c.useCli) {
 			// `devcontainer exec` does not create the container on its own —
 			// it fails with "Dev container not found" until `up` has run.
 			// A first-run image pull can take many minutes, so `up` runs in
@@ -529,24 +562,23 @@ export default function (pi: ExtensionAPI) {
 			// project cwd. A path the kernel sees differently (e.g.
 			// /home/... vs /var/home/...) ends up mounted from the wrong
 			// host directory, hence canonicalization.
-			const wsFolder = cfg.configRoot;
+			const wsFolder = c.configRoot;
 			// Anything the rebuild tool was given is appended to `up` verbatim,
 			// so `--no-cache` reaches the CLI without this extension having to
 			// model a flag set that grows with every CLI release.
 			const upArgs = ["up", "--workspace-folder", wsFolder];
-			if (!cfg.configDefaulted) upArgs.push("--config", cfg.configPath);
+			if (!c.configDefaulted) upArgs.push("--config", c.configPath);
 			upArgs.push(...extraArgs);
 			if (override.features && Object.keys(override.features).length > 0) {
 				upArgs.push("--additional-features", JSON.stringify(override.features));
 			}
 			// exec's --workspace-folder must match the folder used for up.
-			cfg.workspaceFolder = wsFolder;
+			c.workspaceFolder = wsFolder;
 			// Bring the container up in the background and resolve where the
 			// workspace is mounted (e.g. /workspaces/<name>); the first
 			// command awaits this promise. On failure `pendingUp` is rejected
 			// and a call made in the window reports the error instead of a
 			// container-less exec.
-			const c = cfg;
 			// The log is what the tool row, the status bar and the /devcontainer
 			// command all read, so the pull it prints must be captured here. The
 			// CLI writes its progress to stderr as bare-CR frames.
@@ -622,7 +654,7 @@ export default function (pi: ExtensionAPI) {
 				// Only once the container is up: relaying ports of a container
 				// that is still being built reports nothing, and a poll loop
 				// racing `up` would need to be told when to start.
-				void startPortForwarder(c, notify);
+				void startPortForwarder(root, c, notify);
 			})();
 		} else {
 			// docker fallback: bring the container up in the background (a
@@ -632,7 +664,6 @@ export default function (pi: ExtensionAPI) {
 			// inside the container. Provisioning runs afterwards; its marker
 			// lives in the container's own $HOME — which is root for most
 			// images but NOT forced (see ensureDockerContainer).
-			const c = cfg;
 			c.workspaceFolder = declaredWorkspaceFolder;
 			if (override.features && Object.keys(override.features).length > 0) {
 				notify(
@@ -655,24 +686,24 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Offered as soon as bring-up is STARTED: the first tool call awaits
-		// cfg.pendingUp (see settleBringUp), so a pending image pull blocks
+		// pendingUp (see settleBringUp), so a pending image pull blocks
 		// the call rather than making the tool look unavailable.
 		setToolActive(true);
-		bringUpInFlight = true;
+		bringUpInFlight.add(root);
+		byRoot.set(root, c);
 
-		// Both branches above assign `c.pendingUp`, and `c` is the same object
-		// `cfg` points at. A session that never calls the tool would otherwise
-		// surface the rejection unhandled.
-		(cfg.pendingUp as Promise<void>).catch((err: unknown) => {
-			bringUpFinished = true;
+		// Both branches above assign `c.pendingUp`. A session that never calls
+		// the tool would otherwise surface the rejection unhandled.
+		(c.pendingUp as Promise<void>).catch((err: unknown) => {
+			bringUpFinished.add(root);
 			// The log is included because the reason alone is rarely enough: a
 			// build that dies on a feature reports `exit status 1`, and the
 			// line naming the failing feature is in the output the user cannot
 			// otherwise see.
-			const lines = (cfg?.bringUpLog?.snapshot() ?? "").split("\n").filter(Boolean);
+			const lines = (c.bringUpLog?.snapshot() ?? "").split("\n").filter(Boolean);
 			const reason = err instanceof Error ? err.message : String(err);
 			notify(
-				`devcontainer unavailable — commands run through the devcontainer tool will fail until this is fixed: ${reason}\n${
+				`devcontainer for ${root} unavailable — commands run through the devcontainer tool will fail until this is fixed: ${reason}\n${
 					lines.length > 0 ? `last bring-up output (${describePhase(lines)}):\n${lines.slice(-12).join("\n")}` : "(no bring-up output was produced)"
 				}`,
 				"error",
@@ -680,19 +711,19 @@ export default function (pi: ExtensionAPI) {
 		// The `.catch` above resolves on failure too, so the flag after it is set
 		// on both outcomes — which is what /devcontainer polls for.
 		}).then(() => {
-			bringUpFinished = true;
-			bringUpInFlight = false;
+			bringUpFinished.add(root);
+			bringUpInFlight.delete(root);
 		});
 
-		// NOT `return cfg.pendingUp`. `bringUp` is async, so returning the
+		// NOT `return c.pendingUp`. `bringUp` is async, so returning the
 		// promise makes the CALLER's `await bringUp(...)` wait for the whole
-		// bring-up — and the two callers are `session_start` (which would hold
+		// bring-up — and the callers are `session_start` (which would hold
 		// pi's startup for the length of a first-run pull) and the create tool.
 		// Bring-up is deliberately fire-and-forget here; the run and rebuild
-		// tools are what await cfg.pendingUp, through settleBringUp's bounded
+		// tools are what await pendingUp, through settleBringUp's bounded
 		// wait. The comment on the declaration says "returns immediately", and
 		// that promise is the whole reason the tools carry a wait budget.
-		void cfg.pendingUp;
+		void c.pendingUp;
 	};
 
 	/**
@@ -701,37 +732,38 @@ export default function (pi: ExtensionAPI) {
 	 * once and for all, so `ensureReady` alone would let the exec fail with a
 	 * raw "no such container".
 	 *
-	 * Returns true when the container was found dead, brought back up (once),
-	 * and the given `settle` awaiter — re-read from the module `cfg`, which
-	 * bringUp replaced — resolved. Anything else (container alive, a still
-	 * failing bring-up, a session without a project) returns false and the
-	 * original exec error stands.
+	 * Returns the fresh config when the container was found dead, brought
+	 * back up (once), and the given `settle` awaiter — resolved against the
+	 * fresh config, which bringUp placed back in `byRoot` — resolved. Anything
+	 * else (container alive, a still failing bring-up, a session without a
+	 * project) returns null and the original exec error stands.
 	 */
 	const reUpAfterDeath = async (
 		error: unknown,
+		errConfig: DevcontainerConfig,
 		settle: (fresh: DevcontainerConfig) => Promise<void>,
-	): Promise<boolean> => {
-		if (!sessionCwd) return false;
+	): Promise<DevcontainerConfig | null> => {
 		const message = error instanceof Error ? error.message : String(error);
 		// docker exec / devcontainer exec fail differently on a missing
 		// container; both name it. Probing (not string-matching alone) is what
 		// decides: a command that merely failed INSIDE a live container must
 		// not trigger a re-up.
 		const dead = /no such container|is not running/i.test(message);
-		if (!dead) return false;
-		const before = cfg;
-		if (!before) return false;
+		if (!dead) return null;
+		const before = errConfig;
+		if (!before) return null;
 		const alive = await containerAlive(before);
-		if (alive.alive) return false;
+		if (alive.alive) return null;
 		notify(`devcontainer container ${alive.containerName ?? before.containerName ?? "(unknown)"} is gone (${(message.split("\n")[0] ?? message).trim()}); bringing it back up...`, "warning");
-		// bringUp replaces `cfg` with a fresh config carrying a new pendingUp;
+		// bringUp replaces the config with a fresh one carrying a new pendingUp;
 		// the old config's promise is spent and can never settle again.
-		if (bringUpInFlight) return false;
-		await bringUp(sessionCwd, []);
-		const fresh = cfg;
-		if (!fresh || fresh === before || !fresh.pendingUp) return false;
+		const root = canonicalDir(before.projectCwd);
+		if (bringUpInFlight.has(root)) return null;
+		await bringUp(before.projectCwd, []);
+		const fresh = byRoot.get(root);
+		if (!fresh || fresh === before || !fresh.pendingUp) return null;
 		await settle(fresh);
-		return true;
+		return fresh;
 	};
 
 	/**
@@ -754,13 +786,14 @@ export default function (pi: ExtensionAPI) {
 		name: CREATE_TOOL_NAME,
 		label: "Devcontainer config",
 		description: [
-			"Create or edit this project's .devcontainer/devcontainer.json, choosing the base image and features yourself.",
+			"Create or edit a project's .devcontainer/devcontainer.json, choosing the base image and features yourself.",
 			"",
 			"Call it with NO arguments first: it reports the project's stack, the available base images, and the devcontainer feature catalog, and writes nothing. Then call it again with the `image` and `features` you picked. Each call that supplies them rewrites the file and restarts the container, so you can refine it over several calls.",
 			"",
 			"If a config already exists, the file is updated in place and the current contents are shown — pass keys only for what you want to change. Omitting `features` keeps the existing ones, so pass `features: {}` to clear them.",
 			"",
 			"Parameters:",
+			"- `project` (optional): HOST directory of the project to act on when it differs from the session's own project — e.g. a sibling checkout. Relative paths resolve against the session directory. Omit it for this session's project.",
 			"- `featureQuery` (optional): search the ~1440-feature catalog by name, e.g. \"postgres\". Returns real OCI references WITH their major tag, ready to paste. Nothing is written.",
 			"- `featureCollection` (optional): list every feature in one collection, e.g. \"ghcr.io/devcontainers/features\". Nothing is written.",
 			"- `featureVersions` (optional): list every PUBLISHED major version of one feature, newest first, e.g. \"ghcr.io/devcontainers/features/dotnet:2\" → shows whether :1 still exists. Only versions that actually resolve are reported. Nothing is written.",
@@ -780,6 +813,11 @@ export default function (pi: ExtensionAPI) {
 			"Call `create_devcontainer` with no arguments first to see the project's stack, the available base images and the feature catalog, then call it again with the image and features you chose. Use `featureQuery` to search the catalog for a real feature reference. Do not guess OCI image or feature references.",
 		],
 		parameters: Type.Object({
+			project: Type.Optional(
+				Type.String({
+					description: "Host directory of the project to act on when it differs from the session's own project (e.g. a sibling checkout). Relative paths resolve against the session directory. Defaults to the session's project.",
+				}),
+			),
 			featureQuery: Type.Optional(
 				Type.String({ description: "Search the feature catalog by name, e.g. \"postgres\". Returns OCI references with their major tag. Writes nothing." }),
 			),
@@ -810,7 +848,7 @@ export default function (pi: ExtensionAPI) {
 		renderShell: "default",
 		async execute(_toolCallId, params, signal) {
 			if (!sessionCwd) throw new Error("no project directory for this session");
-			const projectRoot = sessionCwd;
+			const projectRoot = params.project === undefined ? sessionCwd : (isAbsolute(params.project) ? params.project : resolve(sessionCwd, params.project));
 			const target = join(projectRoot, ".devcontainer", "devcontainer.json");
 			const bare = join(projectRoot, "devcontainer.json");
 			const existingPath = existsSync(target) ? target : existsSync(bare) ? bare : undefined;
@@ -987,7 +1025,7 @@ export default function (pi: ExtensionAPI) {
 		name: REBUILD_TOOL_NAME,
 		label: "Rebuild devcontainer",
 		description: [
-			"Rebuild this project's devcontainer image from its current config.",
+			"Rebuild a project's devcontainer image from its current config.",
 			"",
 			"Use this after editing anything the image is built from — devcontainer.json, a `dockerFile`, a compose file — when you need the container to actually pick the change up. It re-runs `devcontainer up` in the BACKGROUND, exactly as the session start does, so it can take as long as a first-run pull; the progress streams into this tool row and the devcontainer tool activates again when the container is up.",
 			"",
@@ -995,6 +1033,7 @@ export default function (pi: ExtensionAPI) {
 			"",
 			"Parameters:",
 			"- `extraArgs` (optional): arguments appended to `devcontainer up` verbatim, e.g. \"--no-cache\" or \"--remove-existing-container\". Omit it for a normal rebuild. Anything invalid is rejected by the CLI, with its own message.",
+			"- `project` (optional): HOST directory of the project to rebuild when it differs from the session's own project — e.g. a sibling checkout. Must already have a devcontainer config. Omit it for this session's project.",
 			"- `waitForContainer` (optional): cap in seconds on the wait for the rebuild to finish. By default the call waits until the rebuild is done — pull/build output streams into the tool row while it waits. Pass a cap only if you want the call to come back early while the rebuild keeps running in the background."
 		].join("\n"),
 		promptSnippet: "Rebuild this project's devcontainer image from its config",
@@ -1002,6 +1041,11 @@ export default function (pi: ExtensionAPI) {
 			"After editing `.devcontainer/devcontainer.json`, a `dockerFile` or a compose file, call `devcontainer_rebuild` so the running container matches the change.",
 		],
 		parameters: Type.Object({
+			project: Type.Optional(
+				Type.String({
+					description: "Host directory of the project to rebuild when it differs from the session's own project (e.g. a sibling checkout). Must already have a devcontainer config. Defaults to the session's project.",
+				}),
+			),
 			extraArgs: Type.Optional(
 				Type.String({
 					description: 'Arguments appended to `devcontainer up` verbatim, e.g. "--no-cache". Omit for a normal rebuild.',
@@ -1017,13 +1061,15 @@ export default function (pi: ExtensionAPI) {
 		...createDevcontainerRenderers(),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			if (!sessionCwd) throw new Error("no session directory to rebuild; this tool only works inside a project session");
-			const { path } = loadDevcontainerJson(sessionCwd);
+			const projectDir = params.project === undefined ? sessionCwd : (isAbsolute(params.project) ? params.project : resolve(sessionCwd, params.project));
+			const { path } = loadDevcontainerJson(projectDir);
 			if (!path) {
 				throw new Error(
-					`no devcontainer.json in ${sessionCwd} (searched .devcontainer/, its subdirectories and parent directories); create one with \`${CREATE_TOOL_NAME}\` first — there is nothing to rebuild`,
+					`no devcontainer.json in ${projectDir} (searched .devcontainer/, its subdirectories and parent directories); create one with \`${CREATE_TOOL_NAME}\` first — there is nothing to rebuild`,
 				);
 			}
-			if (bringUpInFlight) {
+			const rebuildRoot = canonicalDir(projectDir);
+			if (bringUpInFlight.has(rebuildRoot)) {
 				throw new Error(
 					"a devcontainer bring-up is already running for this project; a second `up` would race it for the same container. Wait for it to finish — call this again once the devcontainer tool reports the container is up.",
 				);
@@ -1071,9 +1117,10 @@ export default function (pi: ExtensionAPI) {
 					details: tail.counts(),
 				});
 			}
-			await bringUp(sessionCwd, extraArgs);
-			await ensureReady(cfg as DevcontainerConfig, {
-				isEnabled: () => active,
+			await bringUp(projectDir, extraArgs);
+			const rebuilt = byRoot.get(rebuildRoot);
+			await ensureReady(rebuilt as DevcontainerConfig, {
+				isEnabled: () => rebuilt !== undefined && isReady(rebuilt),
 				onProgress: (line) => {
 					tail.append(line);
 					schedule();
@@ -1090,7 +1137,7 @@ export default function (pi: ExtensionAPI) {
 					details: tail.counts(),
 				});
 			}
-			const ready = cfg;
+			const ready = byRoot.get(rebuildRoot);
 			return {
 				content: [
 					{
@@ -1121,12 +1168,16 @@ export default function (pi: ExtensionAPI) {
 	// is still running; a session flag set from the same handlers that report
 	// the outcome is the honest signal, and polling the promise itself would
 	// spin for the life of the session.
-	let bringUpFinished = false;
-	const liveLog = (): BringUpLog => cfg?.bringUpLog ?? new BringUpLog();
+	// Per-root, like `byRoot` and `bringUpInFlight`: /devcontainer polls the
+	// session's own project's bring-up, which is the one its prompt was built
+	// around.
+	const bringUpFinished = new Set<string>();
+	const liveLog = (): BringUpLog => byRoot.get(sessionCwd ? canonicalDir(sessionCwd) : "")?.bringUpLog ?? new BringUpLog();
 	const watchUi = (ui: ExtensionUIContext | null | undefined): void => {
-		const log = cfg?.bringUpLog;
+		const sessionCfg = sessionCwd ? byRoot.get(canonicalDir(sessionCwd)) : undefined;
+		const log = sessionCfg?.bringUpLog;
 		const lines = log ? log.snapshot().split("\n").filter(Boolean) : [];
-		if (!cfg) {
+		if (!sessionCfg) {
 			ui?.notify?.("no devcontainer is being built for this project", "warning");
 			return;
 		}
@@ -1134,13 +1185,13 @@ export default function (pi: ExtensionAPI) {
 			// A one-shot status would be a lie here: nothing has printed yet, so
 			// the widget is what the user watches until output arrives.
 			ui?.setStatus?.("devcontainer", "⏳ devcontainer — waiting for the first output…");
-			const stop = startProgressWidget(ui ?? undefined, liveLog(), cfg.projectCwd);
+			const stop = startProgressWidget(ui ?? undefined, liveLog(), sessionCfg.projectCwd);
 			setTimeout(stop, 1500);
 			return;
 		}
 		// The phase is the part the user cannot read off a raw log line, so
 		// it is stated first; the tail of the log is what they asked for.
-		ui?.notify?.(`devcontainer: ${describePhase(lines)} — ${cfg.projectCwd}\n${lines.slice(-12).join("\n")}`, "info");
+		ui?.notify?.(`devcontainer: ${describePhase(lines)} — ${sessionCfg.projectCwd}\n${lines.slice(-12).join("\n")}`, "info");
 	};
 
 	pi.registerCommand("devcontainer", {
@@ -1152,9 +1203,9 @@ export default function (pi: ExtensionAPI) {
 				// and the log is produced by a background process that may not
 				// have printed yet.
 				ui.setStatus("devcontainer", "⏳ devcontainer — watching bring-up, press esc to stop");
-				const stop = startProgressWidget(ui, liveLog(), cfg?.projectCwd ?? "this project");
+				const stop = startProgressWidget(ui, liveLog(), byRoot.get(sessionCwd ? canonicalDir(sessionCwd) : "")?.projectCwd ?? "this project");
 				const timer = setInterval(() => {
-					if (!bringUpFinished) return;
+					if (!bringUpFinished.has(sessionCwd ? canonicalDir(sessionCwd) : "")) return;
 					clearInterval(timer);
 					stop();
 					ui.notify?.("devcontainer bring-up finished", "info");
@@ -1170,10 +1221,15 @@ export default function (pi: ExtensionAPI) {
 		description: "list the container ports pi has published on the host",
 		handler: async (_args, cmdCtx) => {
 			const ui = cmdCtx?.ui ?? lastUi;
-			const list = forwarder?.list() ?? [];
+			// Every project this session brought up reports its own mapping; the
+			// model deriving a host port from the container port is the mistake
+			// the whole feature exists to prevent.
+			const mappings = [...forwarders.entries()].flatMap(([root, f]) =>
+				f.list().map((p) => `devcontainer (${root}): container ${p.containerPort} -> host 127.0.0.1:${p.hostPort}`),
+			);
 			ui?.notify?.(
-				list.length > 0
-					? list.map((p) => `devcontainer: container ${p.containerPort} -> host 127.0.0.1:${p.hostPort}`).join("\n")
+				mappings.length > 0
+					? mappings.join("\n")
 					: "devcontainer: no container ports are published on the host yet — start a server in the container and they appear here",
 				"info",
 			);
@@ -1198,12 +1254,14 @@ export default function (pi: ExtensionAPI) {
 		// notifications (or hold the process open) after the session ends.
 		shuttingDown = true;
 		active = false;
-		// Host ports bound by a relay outlive the session that asked for them,
-		// so the forwarder is stopped here rather than left to its unref'd
-		// timer, which would keep publishing until the next process ends.
-		forwarder?.stop();
-		forwarder = undefined;
-		cfg = null;
+		// Host ports bound by relays outlive the session that asked for them,
+		// so the forwarders are stopped here rather than left to their unref'd
+		// timers, which would keep publishing until the next process ends.
+		for (const f of forwarders.values()) f.stop();
+		forwarders.clear();
+		byRoot.clear();
+		bringUpInFlight.clear();
+		bringUpFinished.clear();
 		lastUi = null;
 		sessionCwd = null;
 	});
