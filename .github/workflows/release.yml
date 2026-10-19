@@ -81,10 +81,14 @@ jobs:
       # The npmjs.com side is configured once under
       # Packages → devcontainer → Settings → Trusted publisher: repository
       # luxuride-pi-extensions/pi-devcontainer, workflow filename release.yml.
-      # Node 22 covers the CLI's OIDC support (npm >= 11.5.1); id-token: write
-      # is what makes the token mintable at all.
+      # Trusted publishing needs npm >= 11.5.1, and the npm bundled with Node
+      # 22 (10.x) cannot mint the OIDC token — `npm publish` then fails with
+      # ENEEDAUTH before it ever reaches the registry. npm 11 still runs on
+      # Node 22, so install it explicitly for the publish step only.
       - name: publish to npm
-        run: npm publish --access public --provenance
+        run: |
+          npm install -g npm@11
+          npm publish --access public --provenance
 
       - name: pack
         run: |
