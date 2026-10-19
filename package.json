@@ -1,6 +1,6 @@
 {
   "name": "@luxuride-pi/devcontainer",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "pi extension: run project commands inside the project's devcontainer",
   "keywords": [
     "devcontainer",
