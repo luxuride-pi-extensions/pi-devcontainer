@@ -1,169 +1,510 @@
 name: release
 
-# pi loads this extension as TypeScript straight from a clone of this repo,
-# so a tag IS the artifact; the tarball is attached for offline installs.
+# Publishes a GitHub Release from a git tag. There is deliberately no `npm
+# publish` step, because every package here is `"private": true` -- npm refuses
+# to publish a private package, and unsetting it to get a publish through would
+# trade a correct manifest for a working script.
+#
+# What pi actually installs is the CLONE, not the tarball. `installGit()`
+# (dist/core/package-manager.js) does `git clone <repo> <dir>`, an optional
+# `git checkout <ref>`, then `npm install --legacy-peer-deps` inside it, and pi
+# loads the extension's TypeScript from source through jiti. So there is no
+# build step here and nothing to compile: a tag IS the artifact. The tarball is
+# published alongside it for the cases the clone does not cover -- an offline
+# install, an air-gapped review of exactly what shipped, and a diff between two
+# releases that is one tarball rather than one commit range.
+#
+# `pi install git:github.com/luxuride-pi-extensions/<repo>@<tag>` is therefore
+# the supported install for a pinned release.
+
 on:
   push:
     tags:
       - "v*"
+  # A release that cannot be re-run by hand is a release that cannot be
+  # recovered. workflow_dispatch takes the tag to cut and defaults to the
+  # branch it is dispatched from, so a failed or incomplete release can be
+  # rebuilt without deleting and re-pushing the tag.
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to release, e.g. v0.1.0"
+        description: "Tag to release (must already exist on the remote)"
         required: true
+        type: string
 
 permissions:
   contents: write
   id-token: write
 
+concurrency:
+  # Two releases of one repo cannot both be creating the same Git tag object.
+  # cancel-in-progress is deliberately false: cancelling the first would leave a
+  # half-written release page, which is worse than waiting.
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   release:
-    name: build and attach the tarball
+    name: pack and publish
     runs-on: ubuntu-latest
     steps:
-      - name: resolve the tag
-        id: tag
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
-          else
-            tag="${{ github.ref_name }}"
-          fi
-          case "$tag" in
-            v*) ;;
-            *) echo "::error::tag must start with v, got '$tag'"; exit 1 ;;
-          esac
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
+      # Shallow is not enough here, and not only for the checkout itself:
+      # `git describe` is what tells us the tag is on the commit being released.
       - uses: actions/checkout@v5
         with:
-          ref: ${{ steps.tag.outputs.tag }}
-
-      # A release cut from anything but the integration branch's tip would
-      # ship a tree that branch has already moved past; fail loudly instead.
-      - name: the tag is on master
-        run: |
-          set -euo pipefail
-          tag_rev="$(git rev-parse HEAD)"
-          head_rev="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
-          if ! git merge-base --is-ancestor "$tag_rev" "$head_rev"; then
-            echo "::error::tag ${{ steps.tag.outputs.tag }} is not an ancestor of origin/master"
-            exit 1
-          fi
-
-      - name: the tag matches package.json
-        run: |
-          set -euo pipefail
-          version="$(node -p 'require("./package.json").version')"
-          if [ "${{ steps.tag.outputs.tag }}" != "v$version" ]; then
-            echo "::error::tag v$version mismatch: tag is ${{ steps.tag.outputs.tag }}, package.json is $version. Bump the version and commit it BEFORE tagging."
-            exit 1
-          fi
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-          cache: npm
 
-      - name: install dependencies
-        run: npm ci --legacy-peer-deps
-
-      - name: typecheck
-        run: npm run typecheck
-
-      - name: smoke tests
-        run: npm test
-
-      # Publishes to npm as @luxuride-pi/devcontainer via npm trusted
-      # publishing (OIDC): the registry exchange is derived from the workflow's
-      # own identity, so there is no NPM_TOKEN secret and nothing to rotate.
-      # The npmjs.com side is configured once under
-      # Packages → devcontainer → Settings → Trusted publisher: repository
-      # luxuride-pi-extensions/pi-devcontainer, workflow filename release.yml.
-      # Trusted publishing needs npm >= 11.5.1, and the npm bundled with Node
-      # 22 (10.x) cannot mint the OIDC token — `npm publish` then fails with
-      # ENEEDAUTH before it ever reaches the registry. npm 11 still runs on
-      # Node 22, so install it explicitly for the publish step only.
-      - name: publish to npm
-        run: |
-          npm install -g npm@11
-          npm publish --access public --provenance
-
-      - name: pack
+      # pi-unity-blender's three binder scripts ARE that package's product --
+      # they are what moves meshes between a live Blender and a live Unity --
+      # and they are Python files named in `files`. Nothing in CI can execute
+      # them: test/binder-scripts.test.mjs needs a real Blender build that
+      # ubuntu-latest does not have, and skips without one, which is the same
+      # "green with nothing verified" shape this suite is being fixed for. The
+      # release lane already packs the tarball, so it is the last place that
+      # can be sure the shipped Python compiles under the Python it ships for.
+      #
+      # Keyed on the directory existing rather than the package name, so this
+      # one file stays byte-identical in all four repos: the three that ship no
+      # Python skip the loop and report zero, which is a fact, not a failure.
+      - name: the shipped Python compiles
+        if: ${{ hashFiles('binder/scripts/*.py') != '' }}
         run: |
           set -euo pipefail
-          npm pack
-          tarball="$(ls *.tgz)"
-          echo "tarball=$tarball" >> "$GITHUB_ENV"
-          # The files allowlist in package.json must be complete, or the
-          # clone-vs-tarball difference only shows up on the user's machine.
-          tar -tzf "$tarball" | grep -v "^package/$" | sort > packed.txt
-          node -e '
-            const fs = require("node:fs");
-            const pkg = require("./package.json");
-            const wanted = [...pkg.files, "package.json", "README.md"].sort();
-            const packed = fs.readFileSync("packed.txt", "utf8").trim().split("\n").sort();
-            const missing = wanted.filter((f) => !packed.includes(`package/${f}`));
-            const extra = packed.filter((f) => !wanted.includes(f.replace(/^package\//, "")));
-            if (missing.length || extra.length) {
-              if (missing.length) console.error("missing from tarball:\n" + missing.join("\n"));
-              if (extra.length) console.error("shipped but not allowlisted:\n" + extra.join("\n"));
-              process.exit(1);
-            }
-            for (const e of pkg.pi.extensions) if (!packed.includes(`package/${e.replace(/^\.\//, "")}`)) {
-              console.error(`extension entry ${e} is not in the tarball`);
-              process.exit(1);
-            }
-            console.log(`ok ${packed.length} files, pi.extensions entries present`);
-          '
+          count=0
+          for py in binder/scripts/*.py; do
+            python3 -m py_compile "$py"
+            count=$((count + 1))
+          done
+          if [ "$count" -eq 0 ]; then
+            echo "binder/scripts/*.py is non-empty per hashFiles but no file compiled" >&2
+            exit 1
+          fi
+          echo "ok $count shipped Python script(s) compile under $(python3 -V)"
 
-      - name: release notes
+      - name: resolve the tag
+        id: tag
+        env:
+          # A workflow_dispatch's inputs.* is not an environment variable
+          # by itself; it is only readable through the ${{ }} context, and
+          # this shared script reads ONE name for both trigger shapes.
+          # Sourcing the input into INPUT_TAG here gives the step below a
+          # single lookup: set on a dispatch, absent on a tag push, where
+          # GITHUB_REF_NAME is the pushed tag itself.
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # On a tag push GITHUB_REF_NAME is the tag; on a workflow_dispatch
+          # it is the branch, so the dispatch input must win — INPUT_TAG is
+          # set exactly then, and falls back otherwise.
+          tag="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+          case "$tag" in
+            v*) ;;
+            *) echo "tag '$tag' does not start with v" >&2; exit 64 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag from $(git rev-parse --short HEAD)"
+
+      # The tag must name the commit it claims to. A tag pushed at the wrong
+      # moment -- mid-rebase, against the wrong branch -- otherwise produces a
+      # release whose contents do not match its version, and the only way to
+      # find out is to diff two tarballs later.
+      - name: the tag must be on the checked-out commit
+        run: |
+          set -euo pipefail
+          want="${{ steps.tag.outputs.tag }}"
+          got="$(git tag --points-at HEAD | grep -x "$want" || true)"
+          if [ -z "$got" ]; then
+            echo "tag $want is not on $(git rev-parse HEAD); a release must be cut from the commit it names" >&2
+            git log --oneline -3 >&2
+            exit 1
+          fi
+          echo "ok $want is on $(git rev-parse --short HEAD)"
+
+      # The single most useful check a release can do: the tarball's version
+      # must equal the tag's, and its contents must be the ones
+      # test/package-contents.mjs (pi-manager-core) has already proved correct.
+      # Both read the SAME package.json, so neither can drift from the other.
+      - name: the tag and the package version must agree
+        id: version
+        run: |
+          set -euo pipefail
+          name="$(node -p 'require("./package.json").name')"
+          version="$(node -p 'require("./package.json").version')"
+          tag="${{ steps.tag.outputs.tag }}"
+          if [ "$tag" != "v$version" ]; then
+            echo "tag $tag does not match package.json version $version (expected v$version)" >&2
+            echo "Bump the version and commit it BEFORE tagging; the tag is not the place to bump." >&2
+            exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "Releasing $name $version"
+
+      # Verified here, at the moment of publishing, rather than only in CI on
+      # master: a release is the last point at which an incomplete `files`
+      # list can be caught without it reaching a user's machine. The check is
+      # duplicated in each repo on purpose -- a release workflow that borrows
+      # another repository's test needs that repository checked out at the
+      # right ref, which is a moving part a release cannot depend on.
+      #
+      # That duplication is also why the check below is SELF-CONTAINED: it reads
+      # only package.json and npm's own `npm pack --dry-run --json`, and knows
+      # nothing about any other repo in the suite. Keep it that way -- nothing
+      # here may name a sibling repository or a directory that only one of the
+      # four has, because this file is byte-identical in all four by design.
+      #
+      # "Byte-identical in all four" is the load-bearing constraint and it has
+      # now cost real work twice, so it is worth saying why it exists rather
+      # than only what it forbids. A release gate that existed in one repo and
+      # not the others would protect the package it was written for and leave
+      # the other three shipping whatever they shipped before. So the rule is
+      # not "keep the file tidy" -- it is "the gate must be the same gate
+      # everywhere, or it is not a suite-wide gate".
+      #
+      # The corollary is that a repo-specific check keys on something that
+      # EXISTS rather than on the package name: the Python block below is
+      # written so that three repos skip it and one runs it, and a block keyed
+      # on `pkg.name == "pi-unity-blender"` would be correct today and wrong
+      # the day a fifth repo ships Python.
+      #
+      # There is still no sync check keeping the four copies equal. That is a
+      # known gap, not a settled design: pi-manager-core/test/resolver-copies.mjs
+      # enforces byte-identity for manager-core.ts and
+      # scripts/agent-template-checks.mjs, and no equivalent covers this file.
+      #
+      # Zero git tags exist in any of the four repos as of this commit, so the
+      # `tag == v<package.json version>` check below has never been satisfied
+      # and no release has ever been cut through this workflow. There is also no
+      # CHANGELOG.md anywhere in the suite: the notes are generated from
+      # `git log` subjects, which is why that step has no CHANGELOG to read.
+      - name: the tarball ships what the package needs
+        run: |
+          set -euo pipefail
+          npm pack --dry-run --json > pack.json
+          # The script arrives on stdin rather than as `node -e '...'`: the
+          # comments below contain apostrophes, and the first one would
+          # terminate the shell's single-quoted argument and truncate the
+          # script mid-comment. A quoted heredoc interpolates nothing, so
+          # apostrophes, backticks and $ all read verbatim.
+          node --input-type=commonjs - <<'PACK_CHECK'
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const pkg = require("./package.json");
+            const packed = JSON.parse(fs.readFileSync("pack.json", "utf8"));
+            // npm keys the payload by package name, and older npm returns an
+            // array. Read both shapes rather than assume this npm.
+            const p = Array.isArray(packed) ? packed[0] : packed[pkg.name];
+            if (!p) throw new Error(`npm pack --json returned no entry for ${pkg.name}`);
+            const paths = p.files.map((f) => f.path);
+            const missing = [];
+            const entries = Array.isArray(pkg.pi?.extensions) && pkg.pi.extensions.length
+              ? pkg.pi.extensions : ["index.ts"];
+            for (const e of entries) {
+              const rel = e.replace(/^\.\//, "");
+              if (!paths.includes(rel)) missing.push(`extension entry ${rel}`);
+            }
+            for (const bad of ["test/", ".github/"]) {
+              const shipped = paths.filter((x) => x.startsWith(bad));
+              if (shipped.length) missing.push(`${shipped.length} file(s) under ${bad}, e.g. ${shipped[0]}`);
+            }
+
+            // Every entry of `files` must actually be in the tarball, AND every
+            // relative import reachable from a shipped entry must resolve
+            // inside it. pi loads the extension from a git CLONE, where a
+            // missing allowlist entry is invisible -- the file is in the
+            // working tree either way -- so `files` only ever takes effect on
+            // this tarball, and a stale or dropped name there ships a package
+            // that cannot start.
+            //
+            // The import walk is what closes the gap the entry check above
+            // could not see. Every package here imports its runtime through a
+            // relative path from index.ts, written with a .js suffix:
+            //
+            //   pi-manager-core    ./shared/core.js
+            //   pi-blender         ./blender/runtime.js
+            //   pi-unity-vrchat       ./unity/runtime.js
+            //   pi-unity-blender   ./binder/bridge.js
+            //
+            // so those directories are load-bearing exactly as much as the
+            // entry is. Drop `shared/` from `files` and the entry-only check
+            // still reported PASS, while the tarball lost 17 files including
+            // the module index.ts imports.
+            //
+            // Derived from the shipped files and the relative specifiers in
+            // them, so it names no directory of any particular repo and stays
+            // correct in all four, which share this file byte for byte.
+            //
+            // Resolution mirrors what pi and node do for these cases: an exact
+            // path first, then the TS-to-JS rewrite the sources use
+            // (`./blender/runtime.js` in a package that ships
+            // `blender/runtime.ts`, resolved from source by jiti), then the
+            // TypeScript sources themselves, then a directory index.
+            //
+            // The .ts candidates are load-bearing, not belt and braces: all
+            // four packages write their relative imports with a .js suffix and
+            // ship TypeScript, so a resolver that looked only for .js reported
+            // every runtime import in pi-blender, pi-unity-vrchat and
+            // pi-unity-blender as missing. This file is byte-identical in all
+            // four repos, so a check that passes here and fails there is worse
+            // than no check. Verified by running this exact script against all
+            // four packages.
+            const shipped = new Set(paths);
+            const resolveIn = (from, spec) => {
+              const base = path.posix.normalize(
+                path.posix.join(path.posix.dirname(from), spec)
+              );
+              const cands = [base];
+              // Every package here writes its relative imports with a .js
+              // suffix and ships TypeScript -- `./blender/runtime.js` next to a
+              // `blender/runtime.ts` -- and pi resolves that from source
+              // through jiti. So REWRITE the specifier's extension rather
+              // than appending to it: appending would only ever ask for
+              // `runtime.js.ts`, which exists nowhere, and would report every
+              // runtime import in all three consumer packages as missing.
+              if (base.endsWith(".js") || base.endsWith(".mjs") ||
+                  base.endsWith(".cjs")) {
+                const stem = base.replace(/\.(js|mjs|cjs)$/, "");
+                cands.push(stem + ".ts", stem + ".tsx", stem + ".mts",
+                           stem + ".js");
+              } else {
+                cands.push(base + ".ts", base + ".tsx", base + ".mts",
+                           base + ".js");
+              }
+              cands.push(path.posix.join(base, "index.js"),
+                         path.posix.join(base, "index.ts"));
+              return cands.find((c) => shipped.has(c)) || null;
+            };
+            const specifiersOf = (file) => {
+              let src;
+              try {
+                src = fs.readFileSync(file, "utf8");
+              } catch {
+                return [];
+              }
+              // Strip comments before reading specifiers out. These files
+              // discuss their own imports in prose, and every one of the three
+              // consumer packages says in manager-core.ts:
+              //
+              //   It cannot be `typeof import(".../shared/core.js")`, because
+              //   that path is computed at runtime
+              //
+              // which is a COMMENT naming a path that must not exist. Read
+              // without stripping, that sentence is an unresolvable import
+              // and the check fails in all three consumer repos -- while
+              // passing here, where no such comment exists. That asymmetry is
+              // exactly what the byte-identical-copy rule exists to catch.
+              const code = src
+                .replace(/\/\*[\s\S]*?\*\//g, "")
+                .replace(/(^|[^:])\/\/.*$/gm, "$1");
+              return [...code.matchAll(
+                /(?:from|import|require)\s*\(?\s*["'](\.[^"']*)["']/g
+              )].map((m) => m[1]);
+            };
+            // Every `files` entry must also still EXIST in the repository.
+            // An entry naming a deleted path means either a stale allowlist
+            // or a file lost in a commit, and npm reports neither.
+            for (const entry of Array.isArray(pkg.files) ? pkg.files : []) {
+              if (entry.startsWith("!")) continue; // a negation, not a payload
+              const rel = entry.replace(/^\.\//, "").replace(/\/$/, "");
+              if (rel && !fs.existsSync(rel)) {
+                missing.push(
+                  `files entry ${rel} does not exist in this repository`
+                );
+              }
+            }
+
+            // The directories pi actually LOADS at runtime, not just the
+            // extension entries. An entry-only check is what let a `files`
+            // list naming index.ts and nothing else pass: the extension
+            // installs, its manager prompt loads, and every tool it registers
+            // fails to import a module that was never shipped. The
+            // missing-skills case is worse, because it throws nothing at all.
+            //
+            // Keyed by package name and skipped when the source directory does
+            // not exist, so one block is correct in all four repositories and
+            // stays correct in a fifth. That shape is deliberate: a per-repo
+            // literal list would have to be edited in four places, and the
+            // directory it forgets is the one that costs the most and
+            // complains the least.
+            //
+            // The names below are ALWAYS_SHIP and SKILL_DIRS from
+            // pi-manager-core/test/package-contents.mjs -- the same assertion
+            // on the CI side, where it only runs under PI_REQUIRE_PACKAGES=1,
+            // which is why a release needs its own copy.
+            const ALWAYS_SHIP = ["core/", "scripts/", "agents/"];
+            const SKILL_DIRS = {
+              "pi-blender": ["blender/skills"],
+              "pi-unity-vrchat": ["unity/skills"],
+              "pi-unity-blender": ["skills"],
+            };
+            const MODULE_DIRS = {
+              "pi-blender": ["blender/"],
+              "pi-unity-vrchat": ["unity/"],
+              "pi-unity-blender": ["binder/"],
+              "pi-manager-core": ["shared/"],
+            };
+            const runtime = [
+              ...ALWAYS_SHIP,
+              ...(SKILL_DIRS[pkg.name] ?? []),
+              ...(MODULE_DIRS[pkg.name] ?? []),
+            ];
+            for (const d of runtime) {
+              if (!fs.existsSync(d)) continue;
+              if (!paths.some((x) => x.startsWith(d))) {
+                missing.push(
+                  `${d} exists on disk but nothing from it ships, so the extension cannot load it`,
+                );
+              }
+            }
+
+            // The import walk starts at the extension entries, which are
+            // TypeScript in every package here, so it reads .ts as well as
+            // .js. Skipping them -- which an earlier draft of this check did --
+            // silently reduces the whole walk to zero files, and every gap
+            // below it passes.
+            const queue = entries.map((e) => e.replace(/^\.\//, ""));
+            const seen = new Set(queue);
+            while (queue.length) {
+              const file = queue.shift();
+              if (!/\.(ts|tsx|mts|js|mjs|cjs)$/.test(file)) continue;
+              for (const spec of specifiersOf(file)) {
+                const target = resolveIn(file, spec);
+                if (!target) {
+                  missing.push(
+                    `${file} imports ${spec}, which is not in the tarball`
+                  );
+                  continue;
+                }
+                if (!seen.has(target)) {
+                  seen.add(target);
+                  queue.push(target);
+                }
+              }
+            }
+
+            if (missing.length) {
+              // Deduplicated: one unshipped module reached from six import
+              // sites is one fault, and six identical lines in a release log
+              // read as six.
+              const faults = [...new Set(missing)];
+              console.error(
+                `The tarball is not shippable:\n  - ${faults.join("\n  - ")}`
+              );
+              process.exit(1);
+            }
+            console.log(`ok ${p.entryCount} files, ${p.unpackedSize} bytes unpacked`);
+          PACK_CHECK
+          rm -f pack.json
+
+      # The artifact itself. npm pack is used rather than a hand-rolled tar so
+      # the published tarball is byte-for-byte what npm would have published,
+      # which is the property that makes it worth trusting as a record of the
+      # release.
+      - name: build the tarball
+        run: npm pack
+
+      # Publishes the tarball to npm as @luxuride-pi/<name>.
+      # Authentication is npm trusted publishing (OIDC): the registry exchange
+      # is derived from the workflow's own identity, so there is no NPM_TOKEN
+      # secret and nothing to rotate. The npmjs.com side is configured once
+      # per package under Packages → <package> → Settings → Trusted publisher:
+      # repository luxuride-pi-extensions/<repo>, workflow filename
+      # release.yml. Node 22 is required for the CLI's OIDC support (npm
+      # >= 11.5.1); id-token: write is what makes the token mintable at all.
+      # id-token is job-level rather than step-level because Actions only
+      # accepts the permissions block at job scope here.
+      # Node 22 alone is not enough for OIDC: setup-node ships npm 10.x
+      # with it, and npm's OIDC exchange landed in 11.5.1. npm 10 publishes
+      # fine WITH a token, but this publish has no token -- the OIDC claim
+      # IS the credential -- so npm 10 fails ENEEDAUTH here. Upgrade npm
+      # first; the comment above the step below documents the full contract.
+      - name: upgrade npm for trusted publishing
+        run: npm install -g npm@11
+
+      - name: publish to npm
+        run: |
+          npm --version
+          npm publish --access public --provenance
+
+      # Notes are generated, not required from the tagger. A release whose
+      # description is empty still renders correctly, and a workflow that
+      # refuses to release because nobody wrote prose is a release that gets
+      # skipped. git log between the previous tag and this one is the honest
+      # default: it is what actually changed.
+      - name: write the release notes
+        id: notes
         run: |
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
-          previous="$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || true)"
+          previous="$(git describe --tags --abbrev=0 "${tag}^" \
+            2>/dev/null || true)"
           {
+            echo "## $tag"
+            echo
+            if [ -n "$previous" ]; then
+              echo "Changes since $previous:"
+              echo
+              git log --no-merges --pretty="- %s (%h)" "$previous..$tag"
+            else
+              echo "First release."
+              echo
+              git log --no-merges --pretty="- %s (%h)" "$tag"
+            fi
+            echo
             echo "## Install"
             echo
             echo '```bash'
-            echo "pi install git:github.com/luxuride-pi-extensions/pi-devcontainer@$tag"
+            name="${{ steps.version.outputs.name }}"
+            version="${{ steps.version.outputs.version }}"
+            echo "pi install git:github.com/luxuride-pi-extensions/$name@$tag"
             echo '```'
             echo
-            echo "## What changed"
+            echo "Or as a package, for an offline install:"
             echo
-            if [ -n "$previous" ]; then
-              git log --format="- %s" "$previous..$tag"
-            else
-              git log --format="- %s" "$tag"
-            fi
-          } > release-notes.md
-          cat release-notes.md
+            echo '```bash'
+            echo "npm install --legacy-peer-deps ./$name-$version.tgz"
+            echo '```'
+            echo
+            echo "The extension is TypeScript loaded from source;"
+            echo "there is no build step and nothing to compile."
+          } > notes.md
+          echo "wrote notes.md ($(wc -l < notes.md) lines)"
 
-      - name: create the release
+      - name: publish the release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="${{ steps.tag.outputs.tag }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "::error::release $tag already exists"
+          tgz="$(ls ./*.tgz | head -1)"
+          # --verify-tag: publish the tag that is already on the remote rather
+          # than creating one, so a mistyped tag fails here instead of silently
+          # releasing a commit nobody asked for.
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --verify-tag \
+            $tgz
+          echo "published $TAG"
+
+      # The upload is the last step, so a failure anywhere above leaves the tag
+      # in place and re-runnable rather than leaving a release page with no
+      # artifact. If this specific step fails, the fix is to delete the release
+      # (not the tag) and re-run from workflow_dispatch.
+      - name: confirm the artifact is downloadable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --json assets \
+            --jq '.assets[] | "\(.name) \(.size) bytes"'
+          if [ "$(gh release view "$TAG" --json assets \
+            --jq '.assets | length')" -lt 1 ]; then
+            echo "the release exists with no artifact attached" >&2
             exit 1
           fi
-          gh release create "$tag" \
-            --verify-tag \
-            --title "pi-devcontainer $tag" \
-            --notes-file release-notes.md \
-            "$tarball"
-
-      - name: the release carries the tarball
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          assets="$(gh release view "${{ steps.tag.outputs.tag }}" --json assets --jq '.assets[].name')"
-          echo "$assets"
-          echo "$assets" | grep -q "${{ env.tarball }}" || {
-            echo "::error::tarball missing from the release"
-            exit 1
-          }
