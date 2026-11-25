@@ -5,6 +5,7 @@
   "keywords": [
     "devcontainer",
     "docker",
+    "podman",
     "pi-extension",
     "pi-package"
   ],
@@ -13,8 +14,9 @@
   "files": [
     "index.ts",
     "config.ts",
-    "docker.ts",
+    "engine.ts",
     "exec.ts",
+    "fallback.ts",
     "features-index.ts",
     "jsonc.ts",
     "override.ts",

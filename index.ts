@@ -30,10 +30,11 @@
  *   create/attach the container (it fails with "Dev container not found"
  *   until `up` has run). If `up` fails, calls to this tool report the error
  *   rather than running anything on the host.
- * - Otherwise it falls back to plain docker, using the `image` field from
- *   devcontainer.json: it creates/starts a container
- *   `pi-devcontainer-<project>` that mounts the project at its current path
- *   and keeps it alive with `tail -f /dev/null`.
+ * - Otherwise it falls back to a plain container engine (Docker or Podman,
+ *   see engine.ts), using the `image` field from devcontainer.json: it
+ *   creates/starts a container `pi-devcontainer-<project>-<hash>` that
+ *   mounts the project at its current path and keeps it alive with
+ *   `tail -f /dev/null`.
  *
  * Build-based devcontainers (no `image` field) require the devcontainer CLI;
  * without it the tool is never activated.
@@ -64,11 +65,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 import { alreadyInContainer, hasDevcontainerCli, loadDevcontainerJson } from "./config.js";
-import { ensureDockerContainer } from "./docker.js";
+import { engineCliArgs, engineSummary, resolveEngine } from "./engine.js";
+import { ensureFallbackContainer } from "./fallback.js";
 import { run } from "./exec.js";
 import { loadGlobalOverride } from "./override.js";
 import { provisionContainer } from "./provision.js";
-import { containerAlive, ensureReady, runInContainer } from "./run-in-container.js";
+import { containerAlive, containerExecBase, ensureReady, runInContainer } from "./run-in-container.js";
 import { createDevcontainerRenderers, OutputTail, UPDATE_THROTTLE_MS, type DevcontainerDetails } from "./render.js";
 import { collectionsIn, featuresInCollection, loadCatalog, publishedVersions, searchFeatures, type CatalogFeature } from "./features-index.js";
 import { asJsonObject, parseJsonc } from "./jsonc.js";
@@ -152,17 +154,24 @@ export default function (pi: ExtensionAPI) {
 	 * the container port by design (see ports.ts).
 	 */
 	const startPortForwarder = async (root: string, c: DevcontainerConfig, say: (message: string, level?: "info" | "warning" | "error") => void): Promise<void> => {
+		// One engine for the label lookup and the forwarder: asking twice could
+		// resolve two different CLIs if the environment changed in between.
+		const engine = await resolveEngine();
 		// The CLI names its own container; the name this extension invents is
-		// for the docker-fallback container only. Both modes are covered,
-		// because neither is the other's container.
-		const container = c.useCli ? await findCliContainer(c.configRoot) : c.containerName;
+		// for the fallback container only. Both modes are covered, because
+		// neither is the other's container.
+		const container = c.useCli ? await findCliContainer(c.configRoot, engine) : c.containerName;
 		if (!container) return;
-		const f = new PortForwarder(container, {
-			onNotice: say,
-			// The tool result repeats the mapping for the model, which cannot
-			// see a status-bar notice; the user's own copy comes from here.
-			onPublished: () => {},
-		});
+		const f = new PortForwarder(
+			container,
+			{
+				onNotice: say,
+				// The tool result repeats the mapping for the model, which cannot
+				// see a status-bar notice; the user's own copy comes from here.
+				onPublished: () => {},
+			},
+			engine,
+		);
 		await f.noteDeclaredPorts();
 		f.start();
 		forwarders.get(root)?.stop();
@@ -517,11 +526,15 @@ export default function (pi: ExtensionAPI) {
 			configDefaulted,
 			// Include a short hash of the canonical path: two projects sharing a
 			// basename (e.g. ~/work/api and ~/oss/api) would otherwise collide
-			// on one container name, and `ensureDockerContainer` would happily
-			// `docker start` the OTHER project's container and run every
-			// command against the wrong mount.
+			// on one container name, and `ensureFallbackContainer` would happily
+			// start the OTHER project's container and run every command against
+			// the wrong mount.
 			containerName: `pi-devcontainer-${basename(projectDir)}-${createHash("sha256").update(canonicalCwd).digest("hex").slice(0, 6)}`,
 			image,
+			// Published at create time by the fallback engine when it cannot
+			// relay (rootless Podman): the config's own declaration is the only
+			// reachable surface there.
+			appPort: config.appPort,
 			// Overwritten below once the execution mode is known.
 			workspaceFolder: declaredWorkspaceFolder,
 			useCli,
@@ -535,17 +548,30 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// A single "what is happening now" notice; the CLI/docker bring-up
-		// later reports readiness.
+		// Resolved before anything is started: which CLI runs the container
+		// decides the bring-up arguments, the fallback's run line and the port
+		// story, and a resolver problem belongs in a notice now rather than in
+		// every later tool call.
+		const engine = await resolveEngine();
+		if (engine.problem) notify(`devcontainer: ${engine.problem}`, "warning");
+
+		// A single "what is happening now" notice; the bring-up later reports
+		// readiness.
 		notify(
 			useCli
-				? "Starting devcontainer in the background (first run may take a while); the devcontainer tool activates when it is ready..."
-				: "Starting devcontainer container in the background (first run may pull the image)...",
+				? `Starting devcontainer in the background with ${engineSummary(engine)} (first run may take a while); the devcontainer tool activates when it is ready...`
+				: `Starting devcontainer container in the background with ${engineSummary(engine)} (first run may pull the image)...`,
 			"info",
 		);
 
 		// Loaded once and shared by both execution modes.
 		const override = loadGlobalOverride();
+
+		// The argv prefix that reaches the container, engine flags included. The
+		// workspace probe and provisioning go through it so all three steps use
+		// the SAME invocation as the tool: a missing --docker-path in one of
+		// them would silently run that step against the wrong engine.
+		const execInContainer = async (): Promise<[string, ...string[]]> => (await containerExecBase(c)) as [string, ...string[]];
 
 		if (c.useCli) {
 			// `devcontainer exec` does not create the container on its own —
@@ -567,6 +593,11 @@ export default function (pi: ExtensionAPI) {
 			// so `--no-cache` reaches the CLI without this extension having to
 			// model a flag set that grows with every CLI release.
 			const upArgs = ["up", "--workspace-folder", wsFolder];
+			// Which CLI the devcontainer CLI should drive (empty for a plain
+			// docker default, so an older CLI keeps working unchanged). It goes
+			// up front: the caller-appended arguments must stay last so a later
+			// --config or --docker-path from a rebuild still wins.
+			upArgs.push(...(await engineCliArgs(engine)));
 			if (!c.configDefaulted) upArgs.push("--config", c.configPath);
 			upArgs.push(...extraArgs);
 			if (override.features && Object.keys(override.features).length > 0) {
@@ -612,11 +643,9 @@ export default function (pi: ExtensionAPI) {
 					// fall through to the probe
 				}
 				if (!remoteWorkspace) {
-					const probe = await run("devcontainer", [
-						"exec",
-						"--workspace-folder",
-						wsFolder,
-						"--",
+					const probeArgv = await execInContainer();
+					const probe = await run(probeArgv[0], [
+						...probeArgv.slice(1),
 						"bash",
 						"-c",
 						// `cd` must succeed — the exec default cwd can be a host
@@ -639,7 +668,7 @@ export default function (pi: ExtensionAPI) {
 				if (override.provision && override.provision.length > 0) {
 					await provisionContainer(
 						notify,
-						["devcontainer", "exec", "--workspace-folder", wsFolder, "--"],
+						await execInContainer(),
 						override.provision,
 						// Same object handed to `--additional-features` above, so
 						// the provisioning marker key tracks the image rebuild
@@ -657,26 +686,26 @@ export default function (pi: ExtensionAPI) {
 				void startPortForwarder(root, c, notify);
 			})();
 		} else {
-			// docker fallback: bring the container up in the background (a
+			// Fallback mode: bring the container up in the background (a
 			// first-run image pull can take a long time and must not block the
 			// prompt). The declared `workspaceFolder` is honored here (the CLI
 			// cannot be pointed at it) and the mount keeps the host path valid
 			// inside the container. Provisioning runs afterwards; its marker
 			// lives in the container's own $HOME — which is root for most
-			// images but NOT forced (see ensureDockerContainer).
+			// images but NOT forced (see ensureFallbackContainer).
 			c.workspaceFolder = declaredWorkspaceFolder;
 			if (override.features && Object.keys(override.features).length > 0) {
 				notify(
-					"pi-override.json declares features, which only the devcontainer CLI can apply — install the CLI to get them in docker-fallback mode",
+					`pi-override.json declares features, which only the devcontainer CLI can apply — install the CLI to get them in ${engine.kind}-fallback mode`,
 					"warning",
 				);
 			}
 			const log = new BringUpLog();
 			c.bringUpLog = log;
 			c.pendingUp = (async () => {
-				await ensureDockerContainer(c, (d) => log.append(d.toString()));
+				await ensureFallbackContainer(c, (d) => log.append(d.toString()), engine);
 				if (override.provision && override.provision.length > 0) {
-					await provisionContainer(notify, ["docker", "exec", c.containerName], override.provision);
+					await provisionContainer(notify, await execInContainer(), override.provision);
 				}
 				notify(
 					`Devcontainer ready: ${c.containerName} — workspace mounted at ${c.workspaceFolder} (host paths stay valid)`,
@@ -803,7 +832,7 @@ export default function (pi: ExtensionAPI) {
 			"- `postCreateCommand` (optional): command to run once after the container is created.",
 			"- `forwardPorts` (optional): host ports to forward.",
 			"- `stack` (optional): force the detected stack (affects only the defaults; an explicit `image`/`features` wins).",
-			"- `shareHostDocker` (optional): true (the default on Linux) shares the host's Docker daemon by bind-mounting its socket, which is what a project almost always wants. No feature is added for it. false runs a nested docker-in-docker daemon, which cannot work on a host whose Docker data root is on btrfs. An explicit docker-in-docker feature is always left as you wrote it.",
+			"- `shareHostDocker` (optional): true (the default on Linux) shares the host's container daemon by bind-mounting its socket, which is what a project almost always wants. No feature is added for it. false runs a nested docker-in-docker daemon, which cannot work on a host whose Docker data root is on btrfs. An explicit docker-in-docker feature is always left as you wrote it.",
 			"",
 			"Example: a Node project that also needs Postgres —",
 			"create_devcontainer(image: \"mcr.microsoft.com/devcontainers/typescript-node:22\", features: {\"ghcr.io/devcontainers/features/node:1\": {\"version\": \"22\"}, \"ghcr.io/devcontainers/features/postgres:1\": {\"version\": \"16\"}}, postCreateCommand: \"npm install\", forwardPorts: [5432])",
@@ -839,11 +868,11 @@ export default function (pi: ExtensionAPI) {
 			postCreateCommand: Type.Optional(Type.String({ description: "Command run once after the container is created" })),
 			forwardPorts: Type.Optional(Type.Array(Type.Union([Type.Number(), Type.String()]))),
 			stack: Type.Optional(Type.String({ description: "Force the detected stack instead of using detection" })),
-		shareHostDocker: Type.Optional(
-			Type.Boolean({
-				description: "Share the host's Docker daemon by bind-mounting its socket (default true on Linux/other); no feature is written for it. Set false for a nested docker-in-docker daemon — that one fails on a host whose Docker data root is on btrfs. An explicit docker-in-docker feature in `features` is never rewritten.",
-			}),
-		),
+			shareHostDocker: Type.Optional(
+				Type.Boolean({
+					description: "Share the host's container daemon by bind-mounting its socket (default true on Linux/other; the socket path follows the engine, so rootless Podman's user socket is used); no feature is written for it. Set false for a nested docker-in-docker daemon — that one fails on a host whose Docker data root is on btrfs. An explicit docker-in-docker feature in `features` is never rewritten.",
+				}),
+			),
 		}),
 		renderShell: "default",
 		async execute(_toolCallId, params, signal) {
@@ -958,7 +987,10 @@ export default function (pi: ExtensionAPI) {
 			// isolating itself from the host's containers on purpose. It is
 			// only reported, with the btrfs failure mode, so the model can
 			// decide whether the config or the host is what needs changing.
-			const dockerAccess = describeDockerAccess(base);
+			// The engine is resolved (cheaply, from the cache) because a sharing
+			// mount has to point at the socket THIS host serves.
+			const engine = await resolveEngine();
+			const dockerAccess = describeDockerAccess(base, engine);
 			const defaults = scaffold({
 				projectRoot,
 				stack: effectiveStack,
@@ -967,6 +999,7 @@ export default function (pi: ExtensionAPI) {
 				postCreateCommand: params.postCreateCommand,
 				forwardPorts: params.forwardPorts as (number | string)[] | undefined,
 				shareHostDocker: params.shareHostDocker,
+				engine,
 			});
 			const config: Record<string, unknown> = {
 				...base,

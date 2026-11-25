@@ -20,16 +20,25 @@ import { join } from "node:path";
 import { asJsonObject, parseJsonc } from "./jsonc.js";
 import { alreadyInContainer, loadDevcontainerJson } from "./config.js";
 import { provisionContainer } from "./provision.js";
-import { containerAlive, resolveToolCwd, runInContainer, settleBringUp } from "./run-in-container.js";
+import { containerAlive, containerExecBase, resolveToolCwd, runInContainer, settleBringUp } from "./run-in-container.js";
+import { ENGINE_ENV, engineCliArgs, engineSummary, parseEngineSetting, resetEngineCache, resolveEngine } from "./engine.js";
+import { ensureFallbackContainer, publishArgs } from "./fallback.js";
 import { BringUpLog, describePhase, startProgressWidget } from "./progress.js";
 import { DEFAULT_RUN_TIMEOUT, shq, run } from "./exec.js";
-import { DOCKER_IN_DOCKER_FEATURE, DOCKER_OUTSIDE_OF_DOCKER_FEATURE, BASE_IMAGE, BASE_IMAGES, DOTNET_FEATURE, NODE_FEATURE, STACK_FEATURES, baseImageFor, describeDockerAccess, featureFor, projectProfile, scaffold, stackIds } from "./scaffold.js";
+import { DOCKER_IN_DOCKER_FEATURE, DOCKER_OUTSIDE_OF_DOCKER_FEATURE, BASE_IMAGE, BASE_IMAGES, DOTNET_FEATURE, NODE_FEATURE, STACK_FEATURES, baseImageFor, describeDockerAccess, dockerSocketMount, featureFor, projectProfile, scaffold, stackIds } from "./scaffold.js";
 import type { Scaffold } from "./scaffold.js";
 import { collectionsIn, featuresInCollection, loadCatalog, parseFeaturesPage, parseRef, publishedVersions, searchFeatures } from "./features-index.js";
 import { MAX_DISPLAY_BYTES_FOR_TEST, OutputTail } from "./render.js";
 import { parseListeningPorts, parseSocatListenPort, socatArgs } from "./ports.js";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import type { DevcontainerConfig } from "./types.js";
+
+// Engine selection is a HOST question: this extension asks `docker info` and
+// `podman info` what answers. A machine whose Docker daemon is stopped but
+// which has Podman installed would therefore pick Podman and change every
+// argv asserted below, so the suite pins the engine it is written against.
+// The Podman-specific tests set it themselves and reset the cache.
+process.env[ENGINE_ENV] = "docker";
 
 let failures = 0;
 let checks = 0;
@@ -375,6 +384,122 @@ checkTrue("alreadyInContainer is a boolean", typeof alreadyInContainer() === "bo
 	checkTrue("a live container never re-ups", source.includes("if (alive.alive) return null;"), "no re-up");
 	checkTrue("a bring-up in flight never re-ups", source.includes("if (bringUpInFlight.has(root)) return null;"), "in-flight");
 	checkTrue("the re-up re-reads the fresh config", source.includes("if (!fresh || fresh === before"), "fresh");
+}
+
+// --- engine selection: docker or podman --------------------------------
+// Podman is driven through its Docker-compatible command surface, but the two
+// engines do NOT agree on port reachability, the daemon socket, or compose —
+// so what the resolver reports is what the rest of the extension relies on.
+{
+	check("a blank engine setting means auto-detect", parseEngineSetting("   "), undefined);
+	check("`auto` means auto-detect", parseEngineSetting("auto"), undefined);
+	check("a named engine is taken as written", parseEngineSetting("/usr/bin/podman"), "/usr/bin/podman");
+
+	// publishArgs is the fallback's ONLY port mechanism where relaying cannot
+	// work (rootless podman), so what it emits decides whether appPort works.
+	check("a bare port is published on loopback with a chosen host port", publishArgs([3000]), ["-p", "127.0.0.1::3000"]);
+	check("host:container is pinned to loopback", publishArgs(["8080:3000"]), ["-p", "127.0.0.1:8080:3000"]);
+	check("an entry with its own address is taken verbatim", publishArgs(["0.0.0.0:8080:3000"]), ["-p", "0.0.0.0:8080:3000"]);
+	check("no appPort publishes nothing", publishArgs(undefined), []);
+	check("garbage in appPort is ignored, not published", publishArgs([null, true, "  ", -1, 70000]), []);
+}
+
+{
+	const bin = mkdtempSync(join(tmpdir(), "dc-engine-bin-"));
+	const calls = join(bin, "calls.log");
+	const prevPath = process.env.PATH;
+	const prevEngine = process.env[ENGINE_ENV];
+	const prevRuntime = process.env.XDG_RUNTIME_DIR;
+	const shim = (name: string, body: string) => {
+		const file = join(bin, name);
+		writeFileSync(file, body);
+		chmodSync(file, 0o755);
+	};
+	// A rootless podman: `info` reports rootless, and every call is recorded.
+	shim(
+		"podman",
+		`#!/bin/sh\nfor a in "$@"; do printf '%s\\n' "$a"; done >> ${calls}\ncase "$1" in\n--version) echo "podman version 6.1.3";;\ninfo) echo "true";;\ninspect) exit 1;;\nesac\nexit 0\n`,
+	);
+	shim("podman-compose", '#!/bin/sh\necho "podman-compose version 1.0.6"\n');
+	// The devcontainer CLI that knows the flags podman needs.
+	shim(
+		"devcontainer",
+		'#!/bin/sh\nif [ "$1" = "up" ] && [ "$2" = "--help" ]; then\n  echo "  --docker-path string    Docker CLI path."\n  echo "  --docker-compose-path string"\n  exit 0\nfi\nfor last; do :; done\nprintf %s "$last"\n',
+	);
+	process.env.PATH = `${bin}:${prevPath ?? ""}`;
+	process.env[ENGINE_ENV] = "podman";
+	process.env.XDG_RUNTIME_DIR = "/run/user/4242";
+	try {
+		resetEngineCache();
+		const podman = await resolveEngine();
+		check("an explicitly configured engine is used", podman.cli, "podman");
+		check("its kind is podman", podman.kind, "podman");
+		check("rootless comes from podman info", podman.rootless, true);
+		check("a rootless podman container cannot be relayed into", podman.portRouting, "published-only");
+		check("the socket is the user's runtime socket", podman.socketPath, "/run/user/4242/podman/podman.sock");
+		check("podman-compose is used when it answers", podman.composeCli, "podman-compose");
+		check("the summary names engine and mode", engineSummary(podman), "podman version 6.1.3, rootless");
+		check(
+			"the devcontainer CLI is told which engine to drive",
+			await engineCliArgs(podman),
+			["--docker-path", "podman", "--docker-compose-path", "podman-compose"],
+		);
+		if (process.platform === "linux") {
+			check("a rootless podman mounts its user socket at docker's path", dockerSocketMount(podman), {
+				source: "/run/user/4242/podman/podman.sock",
+				target: "/var/run/docker.sock",
+			});
+		}
+
+		const cliCfg = {
+			projectCwd: "/p",
+			configRoot: "/p",
+			configPath: "/p/.devcontainer/devcontainer.json",
+			configDefaulted: true,
+			containerName: "pi-devcontainer-p",
+			workspaceFolder: "/p",
+			useCli: true,
+		} as unknown as DevcontainerConfig;
+		const execBase = await containerExecBase(cliCfg);
+		checkTrue("the exec path passes --docker-path too", execBase.join(" ").includes("--docker-path podman"), execBase.join(" "));
+		const fallbackBase = await containerExecBase({ ...cliCfg, useCli: false } as DevcontainerConfig, { interactive: true });
+		check("the fallback runs the engine itself, with stdin wired", fallbackBase, ["podman", "exec", "-i", "pi-devcontainer-p"]);
+
+		// The fallback is where appPort has to be published by the extension:
+		// with no routable container address there is nothing to relay to.
+		await ensureFallbackContainer(
+			{ ...cliCfg, useCli: false, image: "alpine:3", appPort: ["127.0.0.1:18090:8123", 3000] } as unknown as DevcontainerConfig,
+			undefined,
+			podman,
+		);
+		const recorded = readFileSync(calls, "utf8");
+		checkTrue("the fallback publishes the config's appPort", recorded.includes("-p\n127.0.0.1:18090:8123\n"), recorded);
+		checkTrue("a bare appPort gets an engine-chosen host port", recorded.includes("-p\n127.0.0.1::3000\n"), recorded);
+
+		// A Docker whose daemon is down is not an engine; podman is.
+		shim("docker", "#!/bin/sh\nexit 1\n");
+		delete process.env[ENGINE_ENV];
+		resetEngineCache();
+		const detected = await resolveEngine();
+		check("a dead docker daemon leaves podman as the engine", detected.kind, "podman");
+		check("detection says it was detected", detected.source, "detected");
+
+		// Nothing answers: the name in the error is docker's, with a way out.
+		shim("podman", "#!/bin/sh\nexit 1\n");
+		resetEngineCache();
+		const none = await resolveEngine();
+		check("nothing answering falls back to the docker name", none.cli, "docker");
+		checkTrue("nothing answering is reported as a problem", typeof none.problem === "string" && none.problem.includes(ENGINE_ENV), none.problem);
+		check("plain docker needs no --docker-path", await engineCliArgs(none), []);
+	} finally {
+		process.env.PATH = prevPath;
+		if (prevEngine === undefined) delete process.env[ENGINE_ENV];
+		else process.env[ENGINE_ENV] = prevEngine;
+		if (prevRuntime === undefined) delete process.env.XDG_RUNTIME_DIR;
+		else process.env.XDG_RUNTIME_DIR = prevRuntime;
+		resetEngineCache();
+		rmSync(bin, { recursive: true, force: true });
+	}
 }
 
 // --- stdin is piped, not dropped ---------------------------------------

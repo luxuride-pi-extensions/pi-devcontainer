@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { isAbsolute, relative, resolve } from "node:path";
 
-import { ensureDockerContainer } from "./docker.js";
+import { ensureFallbackContainer } from "./fallback.js";
+import { engineCliArgs, resolveEngine } from "./engine.js";
 import { run, shq } from "./exec.js";
 import { findCliContainer } from "./ports.js";
 import { startProgressWidget } from "./progress.js";
@@ -213,6 +214,39 @@ export interface RunResult {
 }
 
 /**
+ * The argv prefix that runs something in the container, engine included.
+ *
+ * Both modes end with `--`/the container name, so a caller appends its own
+ * command (`bash -c ...`). Split out because bring-up, provisioning and the
+ * tool all have to produce the SAME invocation: three copies of this list
+ * would drift, and a missing `--docker-path` in one of them would silently
+ * run the wrong engine for that one step.
+ *
+ * `interactive` adds `-i` in the two-CLI-free fallback mode only: `docker
+ * exec -i` is what makes stdin reach the command, and the devcontainer CLI
+ * has no equivalent flag (it always wires stdin through).
+ */
+export async function containerExecBase(cfg: DevcontainerConfig, options: { interactive?: boolean } = {}): Promise<string[]> {
+	if (!cfg.useCli) {
+		const engine = await resolveEngine();
+		return [engine.cli, "exec", ...(options.interactive ? ["-i"] : []), cfg.containerName];
+	}
+	const engine = await resolveEngine();
+	// --config is needed only when the config file is NOT at the default
+	// location the CLI resolves by itself (see DevcontainerConfig.configDefaulted).
+	const cliArgs = !cfg.configDefaulted ? ["--config", cfg.configPath] : [];
+	return [
+		"devcontainer",
+		"exec",
+		"--workspace-folder",
+		cfg.workspaceFolder,
+		...cliArgs,
+		...(await engineCliArgs(engine)),
+		"--",
+	];
+}
+
+/**
  * Run one command inside the container and collect its output.
  *
  * `bash -c`, not `-lc`: the login shell re-runs the container's profile
@@ -220,7 +254,7 @@ export interface RunResult {
  * PATH/toolchain confusion this tool exists to avoid. Users who need profile
  * setup should put it in the devcontainer's own postCreateCommand.
  */
-export function runInContainer(
+export async function runInContainer(
 	cfg: DevcontainerConfig,
 	params: { command: string; cwd?: string; stdin?: string; timeout?: number },
 	onData?: (data: Buffer) => void,
@@ -228,18 +262,17 @@ export function runInContainer(
 ): Promise<RunResult> {
 	const { containerCwd, hostCwd } = resolveToolCwd(cfg, params.cwd);
 	const script = `cd ${shq(containerCwd)} && ${params.command}`;
-	// --config is needed only when the config file is NOT at the default
-	// location the CLI resolves by itself (see DevcontainerConfig.configDefaulted).
-	const cliArgs = cfg.useCli && !cfg.configDefaulted ? ["--config", cfg.configPath] : [];
-	const argv: [string, ...string[]] = cfg.useCli
-		? ["devcontainer", "exec", "--workspace-folder", cfg.workspaceFolder, ...cliArgs, "--", "bash", "-c", script]
-		: ["docker", "exec", "-i", cfg.containerName, "bash", "-c", script];
+	// Resolved up front: engine selection can fail (no engine at all, a
+	// devcontainer CLI too old for --docker-path) and that error belongs to the
+	// caller, not to a promise rejected after the spawn.
+	const [cmd, ...args] = [...(await containerExecBase(cfg, { interactive: true })), "bash", "-c", script];
+	if (cmd === undefined) throw new Error("no container CLI resolved for this project");
 
 	return new Promise<RunResult>((resolvePromise, reject) => {
 		// detached + unref: the child must not hold the node process open when
 		// the session ends, but a detached process group is still needed so
 		// abort can kill the whole tree (devcontainer exec spawns children).
-		const child = spawn(argv[0], argv.slice(1), {
+		const child = spawn(cmd, args, {
 			cwd: cfg.projectCwd,
 			detached: true,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -314,7 +347,7 @@ export function runInContainer(
 /** Await bring-up, then run. Shared by every tool call. */
 export async function ensureReady(cfg: DevcontainerConfig, opts: SettleOptions): Promise<void> {
 	await settleBringUp(cfg, opts);
-	if (!cfg.useCli) await ensureDockerContainer(cfg);
+	if (!cfg.useCli) await ensureFallbackContainer(cfg);
 }
 
 /** Result of probing the container the config points at. */
@@ -336,14 +369,17 @@ export interface ContainerAlive {
  */
 export async function containerAlive(cfg: DevcontainerConfig): Promise<ContainerAlive> {
 	let name: string | null = null;
+	// One engine for both the label lookup and the inspect: asking twice could
+	// pick two different CLIs if the environment changed between the calls.
+	const engine = await resolveEngine();
 	if (cfg.useCli) {
-		const found = await findCliContainer(cfg.configRoot);
+		const found = await findCliContainer(cfg.configRoot, engine);
 		if (!found) return { alive: false, containerName: null };
 		name = found;
 	} else {
 		name = cfg.containerName;
 	}
-	const r = await run("docker", ["inspect", "-f", "{{.State.Status}}", name]);
+	const r = await run(engine.cli, ["inspect", "-f", "{{.State.Status}}", name]);
 	if (r.code !== 0) return { alive: false, containerName: name };
 	return { alive: r.stdout.trim() === "running", containerName: name };
 }

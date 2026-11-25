@@ -16,6 +16,8 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
+import type { ContainerEngine } from "./engine.js";
+
 /** Base image every generated config starts from. */
 export const BASE_IMAGE = "mcr.microsoft.com/devcontainers/base:ubuntu";
 
@@ -119,6 +121,14 @@ export interface ScaffoldOptions {
 	 * actually is, and the feature only adds a CLI and env vars on top of it.
 	 */
 	shareHostDocker?: boolean;
+	/**
+	 * The engine this session runs, so a sharing mount points at the socket it
+	 * actually serves (Docker's /var/run/docker.sock, or rootless Podman's user
+	 * socket). Optional: without it the Docker default is assumed, which is
+	 * what a caller with no resolved engine (a test, the plain Docker path)
+	 * wants anyway.
+	 */
+	engine?: ContainerEngine;
 }
 
 export interface Scaffold {
@@ -311,8 +321,12 @@ export function scaffold(options: ScaffoldOptions): Scaffold {
 	// for the same effect, and it cannot work together with a socket mounted
 	// by hand anyway, so the mount is the whole of it.
 	if (socketShared) {
-		const { source, target } = dockerSocketMount();
-		config.mounts = [{ source, target, type: "bind" }];
+		const mount = dockerSocketMount(options.engine);
+		// Undefined means this host has no socket a container could use (a
+		// Podman VM on Windows/macOS). Writing the mount anyway would hand the
+		// container a bind of a path that does not exist on the host, which
+		// fails the whole `up` — so the config simply gets no sharing.
+		if (mount) config.mounts = [{ source: mount.source, target: mount.target, type: "bind" }];
 	}
 	if (options.postCreateCommand) config.postCreateCommand = options.postCreateCommand;
 	if (options.forwardPorts && options.forwardPorts.length > 0) {
@@ -339,13 +353,28 @@ export const DOCKER_IN_DOCKER_FEATURE = "ghcr.io/devcontainers/features/docker-i
 export const DOCKER_OUTSIDE_OF_DOCKER_FEATURE = "ghcr.io/devcontainers/features/docker-outside-of-docker:1";
 
 /**
- * The socket a sharing config mounts. Only Windows differs: the host socket
- * there lives inside the VM at a different name. A macOS host and a Linux one
- * both serve /var/run/docker.sock.
+ * The socket a sharing config mounts, or undefined when this host cannot offer
+ * one.
+ *
+ * Docker serves /var/run/docker.sock (a different name inside the Windows VM).
+ * Podman does not put its API socket there at all: rootless keeps it in the
+ * user's runtime directory, and it only exists while `podman.socket` is
+ * running. Mounting the Podman socket AT /var/run/docker.sock is what makes
+ * the inside of the container look like a Docker host, which is what a
+ * docker-outside-of-docker feature or a plain `docker` client expects.
+ *
+ * Podman on Windows and macOS runs its daemon inside a VM, so there is no host
+ * socket to mount and the sharing is refused rather than written as a mount
+ * that can never work.
  */
-export function dockerSocketMount(): { source: string; target: string } {
+export function dockerSocketMount(engine?: ContainerEngine): { source: string; target: string } | undefined {
+	const POSIX_SOCKET = "/var/run/docker.sock";
+	if (engine?.kind === "podman") {
+		if (process.platform === "win32" || process.platform === "darwin") return undefined;
+		return { source: engine.socketPath, target: POSIX_SOCKET };
+	}
 	if (process.platform === "win32") return { source: "//var/run/docker.sock", target: "//var/run/docker.sock" };
-	return { source: "/var/run/docker.sock", target: "/var/run/docker.sock" };
+	return { source: POSIX_SOCKET, target: POSIX_SOCKET };
 }
 
 /**
@@ -362,6 +391,7 @@ export function dockerSocketMount(): { source: string; target: string } {
  */
 export function describeDockerAccess(
 	config: Record<string, unknown>,
+	engine?: ContainerEngine,
 ): { mode: "dind" | "host-socket" | "none"; note: string } {
 	const features = asRecord(config.features);
 	const dind = Object.keys(features).find(
@@ -377,7 +407,19 @@ export function describeDockerAccess(
 	const shared =
 		Object.keys(features).some((id) => id.includes("docker-outside-of-docker")) ||
 		asArray(config.mounts).some((m) => typeof m === "object" && m !== null && String((m as { target?: unknown }).target).endsWith("docker.sock"));
-	if (shared) return { mode: "host-socket", note: "the config shares the host's Docker daemon through a bind-mounted socket." };
+	if (shared) {
+		const socket = dockerSocketMount(engine);
+		if (!socket) {
+			return {
+				mode: "host-socket",
+				note: `the config shares the host's container daemon through a bind-mounted socket, but ${engine?.kind ?? "this platform"} serves that socket inside a VM here, so the mount has nothing to bind — the container will not reach a daemon.`,
+			};
+		}
+		return {
+			mode: "host-socket",
+			note: `the config shares the host's container daemon through a bind-mounted socket (${socket.source}).`,
+		};
+	}
 	return { mode: "none", note: "the config gives the container no Docker access." };
 }
 

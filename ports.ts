@@ -1,6 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 
+import type { ContainerEngine } from "./engine.js";
+import { resolveEngine } from "./engine.js";
 import { run } from "./exec.js";
 
 /**
@@ -24,6 +26,12 @@ import { run } from "./exec.js";
  * per connection, so a request that opens several sockets (HTTP keep-alive,
  * a browser preloading assets) is not serialized behind the last one, and
  * it survives a session ending without leaving a node process behind.
+ *
+ * Not every engine can be relayed to. A rootless Podman container has no
+ * host-routable address (pasta gives it the host's own network identity), so
+ * socat has nothing to dial and every relay would fail; `devcontainer.json`
+ * `appPort`/`runArgs -p` is the only working mechanism there, and this class
+ * reports those instead of inventing a mapping that cannot connect.
  */
 
 /** Start of the IANA dynamic/private range, the pool high ports come from. */
@@ -122,10 +130,11 @@ export function parseSocatListenPort(line: string): number {
 /**
  * Find the container the CLI created. `devcontainer up` names it after the
  * project and keeps it running, so the name this extension invents for its
- * own docker-fallback container is never the right one to inspect.
+ * own container is never the right one to inspect.
  */
-export async function findCliContainer(configRoot: string): Promise<string | null> {
-	const r = await run("docker", [
+export async function findCliContainer(configRoot: string, engine?: ContainerEngine): Promise<string | null> {
+	const eng = engine ?? (await resolveEngine());
+	const r = await run(eng.cli, [
 		"ps",
 		"--filter",
 		`label=devcontainer.local_folder=${configRoot}`,
@@ -145,11 +154,23 @@ export class PortForwarder {
 	private published: ForwardedPort[] = [];
 	/** Container ports already published by `devcontainer up` itself. */
 	private declared = new Set<number>();
+	/** Engine resolved lazily: the constructor stays synchronous for its callers. */
+	private engine: ContainerEngine | undefined;
+	/** Whether the unreachable-port notice has been said once already. */
+	private explained = false;
 
 	constructor(
 		private readonly containerName: string,
 		private readonly events: ForwarderEvents = {},
-	) {}
+		engine?: ContainerEngine,
+	) {
+		this.engine = engine;
+	}
+
+	private async cli(): Promise<string> {
+		this.engine ??= await resolveEngine();
+		return this.engine.cli;
+	}
 
 	list(): ForwardedPort[] {
 		return this.published.map((p) => ({ ...p }));
@@ -165,7 +186,7 @@ export class PortForwarder {
 	}
 
 	private async declaredContainerPorts(): Promise<number[]> {
-		const r = await run("docker", [
+		const r = await run(await this.cli(), [
 			"inspect",
 			"-f",
 			"{{range $p, $conf := .NetworkSettings.Ports}}{{$p}} {{end}}",
@@ -180,9 +201,38 @@ export class PortForwarder {
 	}
 
 	private async containerIp(): Promise<string | null> {
-		const r = await run("docker", ["inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", this.containerName]);
+		const r = await run(await this.cli(), ["inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", this.containerName]);
 		const ip = r.stdout.trim();
 		return r.code === 0 && ip ? ip : null;
+	}
+
+	/**
+	 * The container ports the engine publishes on the host, with the host port
+	 * it actually bound (which `appPort: "127.0.0.1:8080:3000"` decides, not
+	 * us). Empty when inspect does not answer or nothing is published.
+	 */
+	private async publishedBindings(): Promise<ForwardedPort[]> {
+		const r = await run(await this.cli(), ["inspect", "-f", "{{json .HostConfig.PortBindings}}", this.containerName]);
+		if (r.code !== 0) return [];
+		let bindings: unknown;
+		try {
+			bindings = JSON.parse(r.stdout.trim() || "null");
+		} catch {
+			return [];
+		}
+		if (!bindings || typeof bindings !== "object") return [];
+		const ports: ForwardedPort[] = [];
+		for (const [key, value] of Object.entries(bindings as Record<string, unknown>)) {
+			const containerPort = Number.parseInt(key, 10);
+			if (!Number.isInteger(containerPort) || containerPort <= 0) continue;
+			// One host port per container port is what devcontainer.json can
+			// declare; a second binding for the same container port would make
+			// the reported URL a guess, so the first one wins.
+			const first = Array.isArray(value) ? value[0] : undefined;
+			const hostPort = first && typeof first === "object" ? Number.parseInt(String((first as { HostPort?: unknown }).HostPort ?? ""), 10) : NaN;
+			if (Number.isInteger(hostPort) && hostPort > 0) ports.push({ containerPort, hostPort });
+		}
+		return ports.sort((a, b) => a.containerPort - b.containerPort);
 	}
 
 	start(): void {
@@ -211,16 +261,49 @@ export class PortForwarder {
 	}
 
 	private async poll(): Promise<void> {
+		const engine = this.engine ?? (this.engine = await resolveEngine());
+		if (engine.portRouting === "published-only") {
+			await this.pollPublished(engine);
+			return;
+		}
 		if (this.relays.size > 32) return; // a runaway listener loop is not a dev server
 		// Both families in one exec: two docker round trips per poll would be
 		// wasted on a loop this frequent.
-		const listening = await run("docker", ["exec", this.containerName, "cat", "/proc/net/tcp", "/proc/net/tcp6"]);
+		const listening = await run(await this.cli(), ["exec", this.containerName, "cat", "/proc/net/tcp", "/proc/net/tcp6"]);
 		if (listening.code !== 0) return; // container restarting or gone
 		const ip = await this.containerIp();
 		if (!ip) return;
 		for (const port of parseListeningPorts(listening.stdout)) {
 			if (this.relays.has(port) || this.declared.has(port) || SKIP_PORTS.has(port)) continue;
 			this.relay(ip, port);
+		}
+	}
+
+	/**
+	 * The engine has no host-routable container address, so the ports the
+	 * config published are the whole of the reachable surface. Reporting them
+	 * is still useful: it is the only statement of where a service is, and a
+	 * new one appearing (a rebuild with an added `appPort`) is worth a notice.
+	 */
+	private async pollPublished(engine: ContainerEngine): Promise<void> {
+		const bindings = await this.publishedBindings();
+		if (bindings.length === 0) {
+			if (this.explained) return;
+			this.explained = true;
+			this.events.onNotice?.(
+				`devcontainer: ${engine.kind} cannot reach a port the container opens after start (rootless containers have no host-routable address), and this config publishes none — declare them in devcontainer.json \"appPort\" (e.g. \"appPort\": [3000], or \"127.0.0.1:8080:3000\" for a fixed host port) and rebuild`,
+				"warning",
+			);
+			return;
+		}
+		const known = new Set(this.published.map((p) => p.containerPort));
+		this.published = bindings;
+		for (const port of bindings) {
+			if (known.has(port.containerPort)) continue;
+			this.events.onPublished?.(port);
+			this.events.onNotice?.(
+				`devcontainer: container port ${port.containerPort} -> host 127.0.0.1:${port.hostPort} (published by devcontainer.json, so it is reachable with ${engine.kind}${engine.rootless ? " rootless" : ""})`,
+			);
 		}
 	}
 

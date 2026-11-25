@@ -26,14 +26,50 @@ actually up, so a project without a devcontainer sees no tool it cannot serve.
   - with the `devcontainer` CLI, `devcontainer up` runs in the BACKGROUND at
     session start (never blocking the prompt); the first tool call awaits it,
     streaming pull/build progress into the tool row and the status bar;
-  - without the CLI, a plain `docker run` fallback mounts the workspace at its
-    host path and keeps the container alive — but only for image-based configs;
-    build/dockerCompose configs require the CLI.
-- Container ports are published on the host as the container opens them,
-  announced as `container port -> host 127.0.0.1:<high port>` mappings. Host
-  ports come from the ephemeral range so nothing already listening is
-  displaced; the run tool's result and `/devcontainer-ports` report the
-  mapping, since `localhost:<container port>` is NOT the container's service.
+  - without the CLI, a plain engine-run fallback (`docker run`, `podman run`)
+    mounts the workspace at its host path and keeps the container alive — but
+    only for image-based configs; build/dockerCompose configs require the CLI.
+- Container ports are published on the host, announced as `container port ->
+  host 127.0.0.1:<high port>` mappings. Where the container has a routable
+  address (Docker) a port the container opens LATER is relayed to a free
+  ephemeral host port, so nothing already listening is displaced; where it does
+  not (rootless Podman) the ports published at create time — `appPort` — are
+  reported instead, with a warning when nothing is declared. The run tool's
+  result and `/devcontainer-ports` report the mapping, since
+  `localhost:<container port>` is NOT the container's service.
+
+## Container engine: Docker or Podman
+
+Both are driven through the same Docker-compatible command surface; the engine
+is resolved once per session, in this order:
+
+1. `PI_DEVCONTAINER_ENGINE` — `docker`, `podman`, `auto`, or a command/path;
+   anything matching `podman` is Podman, everything else Docker.
+2. `docker`, when `docker info` answers — the DAEMON, not the client, so a
+   client with a stopped daemon is not an engine.
+3. `podman`, when `podman info` answers.
+4. Otherwise Docker, with a warning naming both failures and the variable.
+
+The resolved engine is used everywhere: `devcontainer up --docker-path
+<podman>` (plus `--docker-compose-path podman-compose` when compose is there),
+`devcontainer exec`, liveness checks, and the CLI-less fallback. Those flags
+are only added when the engine is not a plain `docker`, so a Docker setup —
+including an older CLI that does not know them — behaves exactly as before.
+
+| | Docker | Podman |
+| --- | --- | --- |
+| socket mounted by `shareHostDocker` | `/var/run/docker.sock` | the user's `$XDG_RUNTIME_DIR/podman/podman.sock`, mounted AT `/var/run/docker.sock` so in-container tools still find it (Linux only) |
+| relaying a port opened after start | yes (socat to the container IP) | no: a rootless container's address is the host's own, so nothing is routable — only ports published at create time are reachable |
+
+`appPort` in `devcontainer.json` is therefore how a port reaches the host
+under rootless Podman (`"appPort": [3000]`, or
+`"127.0.0.1:8080:3000"` to pin the host port). The CLI passes it to the engine
+at create time and the extension reports the mapping without relaying; the
+CLI-less fallback publishes `appPort` itself.
+
+Podman notes: `systemctl --user start podman.socket` for `shareHostDocker`;
+compose configs need `podman-compose` on `PATH`; rootless Podman cannot bind
+host ports below 1024.
 
 ## Other projects
 

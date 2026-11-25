@@ -16,10 +16,19 @@ export interface DevcontainerConfig {
 	containerName: string;
 	image?: string;
 	/**
+	 * The config's `appPort` entries, verbatim.
+	 *
+	 * The devcontainer CLI publishes them itself. The fallback engine does too,
+	 * and it is the ONLY port mechanism that can work there when the engine has
+	 * no host-routable container address (rootless Podman), because a port the
+	 * container opens later cannot be relayed to.
+	 */
+	appPort?: unknown;
+	/**
 	 * Host folder to bind-mount. With the devcontainer CLI this MUST be the
 	 * directory containing the `.devcontainer` config (the CLI does not
 	 * search upward), which may differ from `config.workspaceFolder`; with
-	 * the docker fallback it is the config's declared `workspaceFolder`.
+	 * the fallback engine it is the config's declared `workspaceFolder`.
 	 */
 	workspaceFolder: string;
 	useCli: boolean;
@@ -30,7 +39,7 @@ export interface DevcontainerConfig {
 	 */
 	remoteWorkspace?: string;
 	/**
-	 * Background bring-up (`devcontainer up` / docker create) kicked off at
+	 * Background bring-up (`devcontainer up` / a fallback `run`) kicked off at
 	 * session start; the first command awaits it before running.
 	 */
 	pendingUp?: Promise<void>;
